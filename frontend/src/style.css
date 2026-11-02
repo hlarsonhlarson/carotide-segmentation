@@ -1,0 +1,150 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: #0c121c;
+  color: #e3eaf4;
+  font: 15px system-ui;
+}
+header {
+  padding: 24px 32px;
+  border-bottom: 1px solid #273344;
+  display: flex;
+  justify-content: space-between;
+}
+small {
+  color: #95a8bb;
+  font-weight: 400;
+}
+header b {
+  letter-spacing: 3px;
+}
+.layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  min-height: 88vh;
+}
+aside {
+  padding: 24px;
+  background: #131d2a;
+  border-right: 1px solid #273344;
+}
+h1 {
+  font-size: 22px;
+}
+p {
+  color: #9caec2;
+  line-height: 1.6;
+}
+label {
+  display: block;
+  margin-top: 20px;
+  color: #b9c7d9;
+}
+input,
+select,
+button {
+  font: inherit;
+  border: 1px solid #34465a;
+  border-radius: 7px;
+  padding: 11px;
+  color: #e3eaf4;
+  background: #1d2b3c;
+  width: 100%;
+  margin-top: 8px;
+}
+button {
+  cursor: pointer;
+  background: #24596a;
+}
+button:hover {
+  background: #30788b;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+article {
+  padding: 28px;
+  min-width: 0;
+}
+article img {
+  display: block;
+  max-width: 100%;
+  width: 600px;
+  image-rendering: pixelated;
+  cursor: crosshair;
+}
+article input {
+  max-width: 600px;
+}
+.empty {
+  padding: 15vh 8vw;
+}
+.error {
+  padding: 16px;
+  background: #532b32;
+  border: 1px solid #ac5967;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 800px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  header span {
+    display: none;
+  }
+}
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 28px;
+}
+.tabs button {
+  background: #172333;
+}
+.tabs button[aria-pressed="true"] {
+  background: #24596a;
+  border-color: #60b6bc;
+}
+.point-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.point-row span {
+  min-width: 110px;
+}
+.point-row button {
+  width: auto;
+  margin: 0;
+}
+article section > button,
+article section > label {
+  max-width: 600px;
+}
+nav p {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+a {
+  color: #6edbcb;
+}
+details {
+  margin-top: 18px;
+}
+summary {
+  cursor: pointer;
+  color: #7ad1d4;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 2px solid #8ee5db;
+  outline-offset: 3px;
+}

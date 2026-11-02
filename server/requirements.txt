@@ -1,2 +1,12 @@
+-c constraints.txt
 fastapi
 uvicorn[standard]
+pydantic
+numpy
+scipy
+scikit-image
+vtk
+SimpleITK
+pydicom
+tetgen
+Pillow

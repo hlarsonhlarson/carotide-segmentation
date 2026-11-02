@@ -20,6 +20,8 @@ import os
 import subprocess
 import threading
 import time
+import signal
+from .config import SU2_BIN_DIR, MPI_PYTHON
 from pathlib import Path
 
 import numpy as np
@@ -28,15 +30,7 @@ from . import su2_export
 
 log = logging.getLogger("carotid_server")
 
-SU2_BIN_DIR = "/Users/egor/su2-project/install/bin"
 RUNNER_SCRIPT = str(Path(__file__).resolve().parent / "su2_pulsatile_runner.py")
-# The real SU2/pysu2 build's own Python extension (_pysu2.so) was built
-# against Homebrew's python3, not this project's own .venv — CONFIRMED
-# (`PYTHONPATH=.../install/bin python3 -c "import pysu2"` succeeds against
-# /opt/homebrew/bin/python3, not the venv interpreter) — the solver
-# subprocess has to run under that interpreter, independent of whichever
-# Python the FastAPI server itself runs under.
-MPI_PYTHON = "/opt/homebrew/bin/python3"
 
 # Run for this many cardiac cycles — matches the number the standalone
 # pipeline's own real runs used (reaches periodic near-steady-state within
@@ -165,6 +159,9 @@ def run_in_background(job: dict, run_dir: Path, cfg_path: Path, params_path: Pat
     cross-thread-visible-dict pattern app.py's su2_mesh_jobs background
     thread already uses) as its stdout reports progress. Meant to be the
     target of its own daemon thread; blocks until the subprocess exits."""
+    if job.get('cancel_requested'):
+        job['state'] = 'cancelled'
+        return
     env = os.environ.copy()
     env["PYTHONPATH"] = SU2_BIN_DIR + os.pathsep + env.get("PYTHONPATH", "")
     n_procs = mpi_processes()
@@ -175,7 +172,7 @@ def run_in_background(job: dict, run_dir: Path, cfg_path: Path, params_path: Pat
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(run_dir), env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
         )
     except Exception as e:
         log.exception("failed to launch SU2 solver subprocess")
@@ -185,6 +182,8 @@ def run_in_background(job: dict, run_dir: Path, cfg_path: Path, params_path: Pat
 
     job["pid"] = proc.pid
     job["process"] = proc
+    if job.get('cancel_requested'):
+        cancel_run(job)
 
     log_path = run_dir / "solver_stdout.log"
     with open(log_path, "w") as log_f:
@@ -218,8 +217,11 @@ def run_in_background(job: dict, run_dir: Path, cfg_path: Path, params_path: Pat
     returncode = proc.wait()
     job.pop("process", None)
 
-    if job.get("state") == "cancelling":
+    if job.get("cancel_requested"):
         job["state"] = "cancelled"
+    elif returncode != 0:
+        job['state'] = 'error'
+        job['error'] = f'solver exited with code {returncode}; see solver_stdout.log'
     elif job.get("state") == "running":
         # Exited without an explicit SU2DONE/SU2ERROR line — a crash,
         # segfault, or an MPI rank dying doesn't necessarily print either.
@@ -236,13 +238,21 @@ def start_run(job: dict, run_dir: Path, cfg_path: Path, params_path: Path):
 
 
 def cancel_run(job: dict):
-    proc = job.get("process")
+    job['cancel_requested'] = True
+    proc = job.get('process')
     if proc is None or proc.poll() is not None:
+        if job.get('state') == 'running':
+            job['state'] = 'cancelled'
         return False
-    job["state"] = "cancelling"
-    proc.terminate()
+    job['state'] = 'cancelling'
     try:
+        os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    except ProcessLookupError:
+        pass
     return True

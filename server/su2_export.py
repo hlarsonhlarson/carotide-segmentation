@@ -40,6 +40,7 @@ Two steps, both pure Python/VTK, no SimVascular:
      refinement is a follow-up, not a prerequisite for a usable mesh.
 """
 import logging
+from .coordinates import surface_xyz
 import tempfile
 from pathlib import Path
 
@@ -64,7 +65,7 @@ def _xyz(point_mm):
     marching-cubes input image with SetSpacing/SetOrigin reversed) — any
     world point has to go through this same flip to land in the surface's
     own coordinate space."""
-    return [point_mm[2], point_mm[1], point_mm[0]]
+    return surface_xyz(point_mm)
 
 
 def _extract_boundary_loops(poly):

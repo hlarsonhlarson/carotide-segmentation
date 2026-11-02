@@ -3,12 +3,17 @@ import json
 import logging
 import tempfile
 import threading
+import copy
+from contextlib import asynccontextmanager
+import uuid
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
+from typing import Literal
+from . import workflow, projects, storage
 
 from pathlib import Path
 
@@ -20,7 +25,15 @@ from . import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("carotid_server")
 
-app = FastAPI(title="Carotid Segmentation Backend")
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    for case in list(cases._CASES.values()):
+        for job in list(case.su2_run_jobs.values()):
+            su2_run.cancel_run(job)
+
+
+app = FastAPI(title="Carotid Segmentation Backend", lifespan=lifespan)
 
 AXES = {"axial": 0, "coronal": 1, "sagittal": 2}
 SIDES = {"left", "right"}
@@ -47,8 +60,8 @@ class ReorderRequest(BaseModel):
 
 
 class SegmentPointRequest(BaseModel):
-    method: str  # "threshold" | "levelset" | "circle"
-    radius_mm: float
+    method: Literal["auto", "threshold", "levelset", "circle"]  # "threshold" | "levelset" | "circle"
+    radius_mm: float = Field(gt=0, le=50, allow_inf_nan=False)
 
 
 class ManualContourRequest(BaseModel):
@@ -56,10 +69,10 @@ class ManualContourRequest(BaseModel):
 
 
 class SU2ParamsRequest(BaseModel):
-    psv_cms: float
-    edv_cms: float
-    cardiac_cycle_s: float
-    ica_fraction: float
+    psv_cms: float = Field(gt=0, allow_inf_nan=False)
+    edv_cms: float = Field(ge=0, allow_inf_nan=False)
+    cardiac_cycle_s: float = Field(gt=0, allow_inf_nan=False)
+    ica_fraction: float = Field(gt=0, lt=1, allow_inf_nan=False)
     # Separate outlet pressure levels — the pysu2 pipeline this is modeled
     # on (~/Desktop/SU2 Pipeline Code/*/pulsatile_run_generic.py) seeded
     # both outlets' Windkessel from the same single mean_arterial_pressure
@@ -67,8 +80,15 @@ class SU2ParamsRequest(BaseModel):
     # that the two outlets' own downstream beds don't necessarily sit at
     # the same operating pressure, so each needs its own editable value
     # rather than one shared MAP applied to both.
-    ica_map_mmhg: float
-    eca_map_mmhg: float
+    ica_map_mmhg: float = Field(gt=0, allow_inf_nan=False)
+    eca_map_mmhg: float = Field(gt=0, allow_inf_nan=False)
+
+
+    @model_validator(mode="after")
+    def check_velocity(self):
+        if self.edv_cms > self.psv_cms:
+            raise ValueError("EDV must not exceed PSV")
+        return self
 
 
 # Generic literature-ish starting point (not calibrated to any specific
@@ -118,8 +138,11 @@ def _default_window(array: np.ndarray, modality: str):
 
 @app.get("/series")
 def get_series(path: str):
+    path = str(storage.allowed_path(path, "dicom"))
     try:
         return {"series": dicom_io.list_series(path)}
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -131,8 +154,16 @@ def _load_dicom_case(path: str, series_uid: str | None):
     """Shared by create_case and open_project — loads a DICOM series into
     a fresh in-memory CaseState and builds the CaseInfo response dict
     both endpoints return."""
+    path = str(storage.allowed_path(path, "dicom"))
     try:
+        if series_uid is None:
+            available = dicom_io.list_series(path)
+            if len(available) != 1:
+                raise HTTPException(400, "Choose a DICOM series explicitly")
+            series_uid = available[0]["series_uid"]
         array, spacing_mm, origin_mm, modality = dicom_io.load_series(path, series_uid)
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except KeyError as e:
@@ -141,7 +172,7 @@ def _load_dicom_case(path: str, series_uid: str | None):
         log.exception("failed to load series at %s", path)
         raise HTTPException(status_code=400, detail=f"could not load DICOM series: {e}")
 
-    case = cases.create(array, spacing_mm, origin_mm, modality, path, series_uid=series_uid)
+    case = cases.create(array, spacing_mm, origin_mm, modality, str(Path(path).expanduser().resolve()), series_uid=series_uid)
     wl, ww = _default_window(array, modality)
     info = {
         "case_id": case.case_id,
@@ -161,6 +192,7 @@ def create_case(req: LoadCaseRequest):
 
 
 @app.get("/cases/{case_id}/meta")
+@workflow.locked
 def get_meta(case_id: str):
     case = cases.get(case_id)
     if case is None:
@@ -178,6 +210,7 @@ def get_meta(case_id: str):
 
 
 @app.get("/cases/{case_id}/slice")
+@workflow.locked
 def get_slice(case_id: str, axis: str, index: int, wl: float | None = None, ww: float | None = None):
     case = cases.get(case_id)
     if case is None:
@@ -210,6 +243,7 @@ def get_slice(case_id: str, axis: str, index: int, wl: float | None = None, ww: 
 
 
 @app.post("/cases/{case_id}/autoseed")
+@workflow.edit
 def autoseed(case_id: str):
     raise HTTPException(status_code=501, detail="not implemented yet")
 
@@ -257,9 +291,11 @@ def _invalidate_segmentation(case, side, branch):
     did this (see its own comment); every other path-mutating endpoint
     needs the same reset."""
     case.segmentation_series.pop((side, branch), None)
+    workflow.invalidate(case, side)
 
 
 @app.post("/cases/{case_id}/centerline/{side}/{branch}/points")
+@workflow.edit
 def add_centerline_point(case_id: str, side: str, branch: str, req: AddPointRequest):
     case = cases.get(case_id)
     if case is None:
@@ -279,6 +315,7 @@ AUTO_TRACE_SEARCH_MARGIN_MM = 30.0
 
 
 @app.post("/cases/{case_id}/centerline/{side}/{branch}/auto_trace")
+@workflow.edit
 def auto_trace_centerline(case_id: str, side: str, branch: str, req: AutoTraceRequest):
     """Full point-to-point auto-trace between exactly two clicked
     endpoints (start of the branch, tip of the branch) — replaces
@@ -318,6 +355,7 @@ def auto_trace_centerline(case_id: str, side: str, branch: str, req: AutoTraceRe
 
 
 @app.put("/cases/{case_id}/centerline/{side}/{branch}/points/{index}")
+@workflow.edit
 def move_centerline_point(case_id: str, side: str, branch: str, index: int, req: AddPointRequest):
     case = cases.get(case_id)
     if case is None:
@@ -336,6 +374,7 @@ def move_centerline_point(case_id: str, side: str, branch: str, index: int, req:
 
 
 @app.delete("/cases/{case_id}/centerline/{side}/{branch}/points/{index}")
+@workflow.edit
 def delete_centerline_point(case_id: str, side: str, branch: str, index: int):
     case = cases.get(case_id)
     if case is None:
@@ -353,6 +392,7 @@ def delete_centerline_point(case_id: str, side: str, branch: str, index: int):
 
 
 @app.put("/cases/{case_id}/centerline/{side}/{branch}/reorder")
+@workflow.edit
 def reorder_centerline_points(case_id: str, side: str, branch: str, req: ReorderRequest):
     case = cases.get(case_id)
     if case is None:
@@ -371,6 +411,7 @@ def reorder_centerline_points(case_id: str, side: str, branch: str, req: Reorder
 
 
 @app.delete("/cases/{case_id}/centerline/{side}/{branch}")
+@workflow.edit
 def clear_centerline(case_id: str, side: str, branch: str):
     case = cases.get(case_id)
     if case is None:
@@ -383,6 +424,7 @@ def clear_centerline(case_id: str, side: str, branch: str):
 
 
 @app.get("/cases/{case_id}/control_points")
+@workflow.locked
 def get_control_points(case_id: str):
     case = cases.get(case_id)
     if case is None:
@@ -391,6 +433,7 @@ def get_control_points(case_id: str):
 
 
 @app.get("/cases/{case_id}/centerline")
+@workflow.locked
 def get_centerlines(case_id: str):
     case = cases.get(case_id)
     if case is None:
@@ -453,6 +496,7 @@ def _contour_compactness(contour_px):
 
 
 @app.post("/cases/{case_id}/segment/{side}/{branch}/prepare")
+@workflow.edit
 def prepare_series(case_id: str, side: str, branch: str):
     case = cases.get(case_id)
     if case is None:
@@ -463,6 +507,7 @@ def prepare_series(case_id: str, side: str, branch: str):
         raise HTTPException(status_code=400, detail="no path marked for this branch yet")
 
     series = path_series.build_series(path, case.spacing_mm, case.origin_mm)
+    workflow.invalidate(case, side)
     case.segmentation_series[(side, branch)] = series
     return {
         "side": side, "branch": branch, "n_points": len(series),
@@ -472,6 +517,7 @@ def prepare_series(case_id: str, side: str, branch: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/{branch}/slice/{index}")
+@workflow.locked
 def get_segment_slice(case_id: str, side: str, branch: str, index: int,
                        wl: float | None = None, ww: float | None = None):
     case, series = _get_series_point(case_id, side, branch, index)
@@ -493,6 +539,7 @@ def get_segment_slice(case_id: str, side: str, branch: str, index: int,
 
 
 @app.post("/cases/{case_id}/segment/{side}/{branch}/point/{index}")
+@workflow.edit
 def segment_point(case_id: str, side: str, branch: str, index: int, req: SegmentPointRequest):
     if req.method not in ("threshold", "levelset", "circle", "auto"):
         raise HTTPException(status_code=400, detail="method must be 'threshold', 'levelset', 'circle', or 'auto'")
@@ -551,6 +598,7 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
     ]
     fitted_radius_mm = _polygon_radius_mm(contour_px, RESLICE_PX_SPACING_MM)
 
+    workflow.invalidate(case, side)
     series[index] = {
         **point,
         "contour_px": contour_px_list,
@@ -566,6 +614,7 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
 
 
 @app.post("/cases/{case_id}/segment/{side}/{branch}/point/{index}/manual")
+@workflow.edit
 def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: ManualContourRequest):
     """Stores a ring the user drew by hand (clicked vertices on the
     oblique slice) instead of an algorithm's detection — for points where
@@ -574,7 +623,7 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
     this point's own oblique-slice grid basis (same as segment_point) just
     to convert the given pixel points to world-mm consistently; the slice
     image itself isn't needed here."""
-    if len(req.contour_px) < 3:
+    if len(req.contour_px) < 3 or any(len(p) != 2 or not np.isfinite(p).all() for p in req.contour_px):
         raise HTTPException(status_code=400, detail="a ring needs at least 3 points")
     case, series = _get_series_point(case_id, side, branch, index)
     point = series[index]
@@ -590,6 +639,7 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
     ]
     fitted_radius_mm = _polygon_radius_mm(req.contour_px, RESLICE_PX_SPACING_MM)
 
+    workflow.invalidate(case, side)
     series[index] = {
         **point,
         "contour_px": contour_px_list,
@@ -605,17 +655,20 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
 
 
 @app.delete("/cases/{case_id}/segment/{side}/{branch}/point/{index}")
+@workflow.edit
 def delete_segment_point(case_id: str, side: str, branch: str, index: int):
     """Clears a point back to "not segmented" — for a result that's
     plain wrong (leaked into adjacent tissue, auto-seeded badly) where
     leaving a wrong ring in the wall preview is worse than a gap."""
     case, series = _get_series_point(case_id, side, branch, index)
     point = series[index]
+    workflow.invalidate(case, side)
     series[index] = {"point_mm": point["point_mm"], "tangent_mm": point["tangent_mm"]}
     return {"side": side, "branch": branch, "index": index}
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_params")
+@workflow.locked
 def get_su2_params(case_id: str, side: str):
     """Returns this side's stored boundary-condition parameters, or the
     generic defaults if none have been set yet — so the Boundary
@@ -636,17 +689,22 @@ def get_su2_params(case_id: str, side: str):
 
 
 @app.post("/cases/{case_id}/segment/{side}/su2_params")
+@workflow.edit
 def set_su2_params(case_id: str, side: str, req: SU2ParamsRequest):
     case = cases.get(case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="unknown case_id")
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    if case.su2_params.get(side) != req.model_dump():
+        case.revisions[side]['params'] += 1
+        workflow.invalidate(case, side, 'cfd')
     case.su2_params[side] = req.model_dump()
     return case.su2_params[side]
 
 
 @app.get("/cases/{case_id}/segment/{side}/{branch}")
+@workflow.locked
 def get_segmentation_series(case_id: str, side: str, branch: str):
     case = cases.get(case_id)
     if case is None:
@@ -657,6 +715,7 @@ def get_segmentation_series(case_id: str, side: str, branch: str):
 
 
 @app.post("/cases/{case_id}/segment/{side}/build_surface")
+@workflow.edit
 def build_surface_endpoint(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -683,13 +742,17 @@ def build_surface_endpoint(case_id: str, side: str):
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     build_surface.write_stl(poly, tmp_path)
+    workflow.invalidate(case, side, 'mesh')
+    case.saved_artifacts.pop(f'{side}:surface', None)
     case.built_surfaces[side] = tmp_path.read_bytes()
+    case.stale[side].discard('surface')
     tmp_path.unlink(missing_ok=True)
 
     return diag
 
 
 @app.get("/cases/{case_id}/mesh/{side}")
+@workflow.locked
 def get_mesh(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -701,6 +764,7 @@ def get_mesh(case_id: str, side: str):
 
 
 @app.post("/cases/{case_id}/segment/{side}/su2_mesh")
+@workflow.edit
 def start_su2_mesh(case_id: str, side: str):
     """Kicks off a CFD-ready volume mesh (.vtu) + boundary surface (.vtp,
     ModelFaceID-tagged) build in a background thread — a real TetGen run
@@ -730,7 +794,10 @@ def start_su2_mesh(case_id: str, side: str):
     if poly is None:
         raise HTTPException(status_code=400, detail=diag.get("error", "surface build failed"))
 
-    case.su2_mesh_jobs[side] = {"state": "running", "stage": "tagging_faces", "stage_info": {}}
+    workflow.invalidate(case, side, 'mesh')
+    job = {"state": "running", "stage": "tagging_faces", "stage_info": {}}
+    case.su2_mesh_jobs[side] = job
+    series_by_branch = copy.deepcopy(series_by_branch)
     # A rebuilt mesh invalidates any previous run/results for this side —
     # without this, an old finished (or restored-from-disk) su2_run/
     # su2_postprocess stays reachable via its own status/result endpoints
@@ -747,29 +814,32 @@ def start_su2_mesh(case_id: str, side: str):
         # replacing case.su2_mesh_jobs[side]) so a status poll racing this
         # background thread can never see a "running" entry that's
         # momentarily missing "stage" — the dict is always complete.
-        job = case.su2_mesh_jobs.get(side)
-        if job is not None and job.get("state") == "running":
-            job["stage"] = stage
-            job["stage_info"] = info
+        with case.lock:
+            if case.su2_mesh_jobs.get(side) is job:
+                job.update(stage=stage, stage_info=info)
 
     def run_job():
         try:
             vtu_bytes, vtp_bytes, face_map, mesh_diag = su2_export.build_su2_mesh(
                 poly, series_by_branch, on_stage=on_stage
             )
-            case.su2_mesh_jobs[side] = {
-                "state": "done", "vtu": vtu_bytes, "vtp": vtp_bytes,
-                "face_map": {str(k): v for k, v in face_map.items()}, "diag": mesh_diag,
-            }
+            with case.lock:
+                if case.su2_mesh_jobs.get(side) is job:
+                    job.update(state="done", vtu=vtu_bytes, vtp=vtp_bytes,
+                               face_map={str(k): v for k, v in face_map.items()}, diag=mesh_diag)
+                    case.stale[side].discard('mesh')
         except Exception as e:
             log.exception("su2 mesh job failed for %s/%s", case_id, side)
-            case.su2_mesh_jobs[side] = {"state": "error", "error": str(e)}
+            with case.lock:
+                if case.su2_mesh_jobs.get(side) is job:
+                    job.update(state="error", error=str(e))
 
     threading.Thread(target=run_job, daemon=True).start()
     return {"side": side, "state": "running"}
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_mesh/status")
+@workflow.locked
 def su2_mesh_status(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -790,6 +860,7 @@ def su2_mesh_status(case_id: str, side: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_mesh/vtu")
+@workflow.locked
 def get_su2_mesh_vtu(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -801,6 +872,7 @@ def get_su2_mesh_vtu(case_id: str, side: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_mesh/vtp")
+@workflow.locked
 def get_su2_mesh_vtp(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -812,6 +884,7 @@ def get_su2_mesh_vtp(case_id: str, side: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_mesh/preview_stl")
+@workflow.locked
 def get_su2_mesh_preview_stl(case_id: str, side: str):
     """Binary-STL conversion of the finished mesh's own boundary surface
     — lets the Swift client's existing STL preview viewer show a just-
@@ -829,6 +902,7 @@ def get_su2_mesh_preview_stl(case_id: str, side: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_mesh/geometry")
+@workflow.locked
 def su2_mesh_geometry(case_id: str, side: str):
     """Cap diameters/centroids/outward-normals + the angle(s) between
     outlet caps, straight from the finished mesh's own boundary surface —
@@ -863,6 +937,7 @@ def _inlet_direction_xyz(case, side):
 
 
 @app.post("/cases/{case_id}/segment/{side}/su2_run")
+@workflow.edit
 def start_su2_run(case_id: str, side: str):
     """Kicks off the actual SU2 pulsatile CFD solve (mpirun + pysu2) as a
     background subprocess — see server/su2_run.py. Returns immediately;
@@ -881,12 +956,18 @@ def start_su2_run(case_id: str, side: str):
     if not mesh_job or mesh_job.get("state") != "done":
         raise HTTPException(status_code=400, detail="build the SU2 mesh for this side before running CFD")
 
-    su2_params = case.su2_params.get(side, SU2_PARAM_DEFAULTS)
+    if side not in case.su2_params:
+        raise HTTPException(400, "Review and save boundary conditions before running CFD")
+    from .config import solver_errors
+    errors = solver_errors()
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+    su2_params = dict(case.su2_params[side])
     inlet_direction = _inlet_direction_xyz(case, side)
     face_map = {int(k): v for k, v in mesh_job["face_map"].items()}
 
     if case.project_dir:
-        run_dir = Path(case.project_dir) / f"su2_run_{side}"
+        run_dir = Path(case.project_dir) / "runs" / f"{side}_{uuid.uuid4().hex}"
     else:
         run_dir = Path(tempfile.mkdtemp(prefix=f"carotid_su2_run_{case_id}_{side}_"))
 
@@ -899,6 +980,9 @@ def start_su2_run(case_id: str, side: str):
         raise HTTPException(status_code=400, detail=f"failed to prepare CFD run: {e}")
 
     job = {"state": "running", "step": 0, "total_steps": time_iter, "output_dir": str(run_dir)}
+    workflow.invalidate(case, side, 'cfd')
+    job['params'] = su2_params
+    job['revisions'] = dict(case.revisions[side])
     case.su2_run_jobs[side] = job
     # A fresh run invalidates whatever postprocessed results the *previous*
     # run left behind (possibly restored from a saved project, describing
@@ -912,6 +996,7 @@ def start_su2_run(case_id: str, side: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_run/status")
+@workflow.locked
 def su2_run_status(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -925,6 +1010,7 @@ def su2_run_status(case_id: str, side: str):
 
 
 @app.post("/cases/{case_id}/segment/{side}/su2_run/cancel")
+@workflow.edit
 def cancel_su2_run(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -937,6 +1023,7 @@ def cancel_su2_run(case_id: str, side: str):
 
 
 @app.post("/cases/{case_id}/segment/{side}/su2_postprocess")
+@workflow.edit
 def start_su2_postprocess(case_id: str, side: str):
     """Builds the hemodynamic results (TAWSS/OSI/RRT/pressure on the
     wall + geometry stats) from a finished CFD run's own flow_*.vtu
@@ -964,17 +1051,17 @@ def start_su2_postprocess(case_id: str, side: str):
     run_dir = Path(run_job["output_dir"])
     vtp_bytes = mesh_job["vtp"]
     face_map = {int(k): v for k, v in mesh_job["face_map"].items()}
-    su2_params = case.su2_params.get(side, SU2_PARAM_DEFAULTS)
+    su2_params = run_job["params"]
     cycle_s = su2_params["cardiac_cycle_s"]
 
     job = {"state": "running", "frame": 0, "total_frames": 0}
+    case.saved_artifacts.pop(f"{side}:cfd", None)
     case.su2_postprocess_jobs[side] = job
 
     def on_frame(i, total):
-        j = case.su2_postprocess_jobs.get(side)
-        if j is not None and j.get("state") == "running":
-            j["frame"] = i
-            j["total_frames"] = total
+        with case.lock:
+            if case.su2_postprocess_jobs.get(side) is job:
+                job.update(frame=i, total_frames=total)
 
     def run_job_thread():
         try:
@@ -992,7 +1079,7 @@ def start_su2_postprocess(case_id: str, side: str):
             # numpy, served one frame at a time by the /frame endpoint
             # below instead, so a time-scrubbing UI only ever pays for
             # the one frame it's currently showing.
-            case.su2_postprocess_jobs[side] = {
+            completed = {
                 "state": "done",
                 "result": {
                     "points_mm": series["points_mm"].tolist(),
@@ -1010,15 +1097,27 @@ def start_su2_postprocess(case_id: str, side: str):
                     "pressure_pa": derived["pressure_frames_pa"],
                 },
             }
+            completed['provenance'] = {
+                'run_dir': str(run_dir), 'params': su2_params,
+                'revisions': run_job['revisions'],
+                'quality': 'unvalidated', 'run_state': run_job['state'],
+            }
+            with case.lock:
+                if case.su2_postprocess_jobs.get(side) is job:
+                    case.su2_postprocess_jobs[side] = completed
+                    case.stale[side].discard('cfd')
         except Exception as e:
             log.exception("su2 postprocess job failed for %s/%s", case_id, side)
-            case.su2_postprocess_jobs[side] = {"state": "error", "error": str(e)}
+            with case.lock:
+                if case.su2_postprocess_jobs.get(side) is job:
+                    job.update(state="error", error=str(e))
 
     threading.Thread(target=run_job_thread, daemon=True).start()
     return {"side": side, "state": "running"}
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_postprocess/status")
+@workflow.locked
 def su2_postprocess_status(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -1036,6 +1135,7 @@ def su2_postprocess_status(case_id: str, side: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_postprocess/result")
+@workflow.locked
 def su2_postprocess_result(case_id: str, side: str):
     case = cases.get(case_id)
     if case is None:
@@ -1047,6 +1147,7 @@ def su2_postprocess_result(case_id: str, side: str):
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_postprocess/frame/{index}")
+@workflow.locked
 def su2_postprocess_frame(case_id: str, side: str, index: int, field: str = "wss"):
     """One instantaneous frame's per-wall-point values — see
     start_su2_postprocess's own comment for why this is split out of
@@ -1068,310 +1169,18 @@ def su2_postprocess_frame(case_id: str, side: str, index: int, field: str = "wss
     return {"index": index, "t": times_s[index], "values": frames[index].tolist()}
 
 
-class SetProjectRequest(BaseModel):
-    path: str
+
+@app.get("/cases/{case_id}/workflow/{side}")
+@workflow.locked
+def get_workflow(case_id: str, side: str):
+    return workflow.status(cases.get(case_id), side)
 
 
-@app.post("/cases/{case_id}/project")
-def set_project_dir(case_id: str, req: SetProjectRequest):
-    """Every workflow step's own "Save" button (see the /save/* endpoints
-    below) writes into this same folder, chosen once per case right after
-    loading it — so losing the in-memory case (a backend restart) only
-    loses progress that was never explicitly saved, not everything."""
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    folder = Path(req.path)
-    folder.mkdir(parents=True, exist_ok=True)
-    case.project_dir = str(folder)
-    # Written once here (not inside each individual /save/* endpoint)
-    # since it never changes across those saves — source_path/series_uid
-    # are fixed for the lifetime of a case. This is what /projects/open
-    # reads to know which DICOM series to reload.
-    manifest = {"source_path": case.source_path, "series_uid": case.series_uid}
-    (folder / "project.json").write_text(json.dumps(manifest, indent=2))
-    return {"project_dir": case.project_dir}
+@app.get("/health")
+def health():
+    from .config import solver_errors
+    return {"status": "ok", "solver_errors": solver_errors()}
 
 
-@app.get("/cases/{case_id}/project")
-def get_project_dir(case_id: str):
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    return {"project_dir": case.project_dir}
-
-
-def _require_project_dir(case) -> Path:
-    if not case.project_dir:
-        raise HTTPException(status_code=400, detail="no project folder chosen yet for this case")
-    folder = Path(case.project_dir)
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
-
-
-@app.post("/cases/{case_id}/save/centerline/{side}")
-def save_centerline_to_project(case_id: str, side: str):
-    """Pathway step's own Save — both branches' click points (the sparse
-    ones the user actually placed, so re-opening this later can be
-    edited the same way) and the dense auto-stitched path."""
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    if side not in SIDES:
-        raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
-    folder = _require_project_dir(case)
-    payload = {
-        branch: {
-            "control_points": case.control_points.get((side, branch), []),
-            "centerline_points": case.centerline_points.get((side, branch), []),
-        }
-        for branch in BRANCHES
-    }
-    path = folder / f"{side}_centerline.json"
-    path.write_text(json.dumps(payload, indent=2))
-    return {"saved_to": str(path)}
-
-
-@app.post("/cases/{case_id}/save/segmentation/{side}")
-def save_segmentation_to_project(case_id: str, side: str):
-    """Segmentation step's own Save — the full per-point Series (contours,
-    radii, method) for both branches, the single most time-consuming
-    thing to redo from scratch if it's ever lost."""
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    if side not in SIDES:
-        raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
-    folder = _require_project_dir(case)
-    payload = {branch: case.segmentation_series.get((side, branch), []) for branch in BRANCHES}
-    path = folder / f"{side}_segmentation.json"
-    path.write_text(json.dumps(payload, indent=2))
-    return {"saved_to": str(path)}
-
-
-@app.post("/cases/{case_id}/save/surface/{side}")
-def save_surface_to_project(case_id: str, side: str):
-    """Surface step's own Save — the last Build Surface STL for this
-    side, already cached in case.built_surfaces (no rebuild needed)."""
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    stl_bytes = case.built_surfaces.get(side)
-    if stl_bytes is None:
-        raise HTTPException(status_code=404, detail="no surface built yet for this side — call build_surface first")
-    folder = _require_project_dir(case)
-    path = folder / f"{side}_surface.stl"
-    path.write_bytes(stl_bytes)
-    return {"saved_to": str(path)}
-
-
-@app.post("/cases/{case_id}/save/mesh/{side}")
-def save_mesh_to_project(case_id: str, side: str):
-    """Meshing step's own Save — the finished SU2 mesh's .vtu + .vtp."""
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    job = case.su2_mesh_jobs.get(side)
-    if not job or job.get("state") != "done":
-        raise HTTPException(status_code=404, detail="no finished mesh job for this side")
-    folder = _require_project_dir(case)
-    vtu_path = folder / f"{side}_mesh.vtu"
-    vtp_path = folder / f"{side}_mesh_surface.vtp"
-    vtu_path.write_bytes(job["vtu"])
-    vtp_path.write_bytes(job["vtp"])
-    return {"saved_to": [str(vtu_path), str(vtp_path)]}
-
-
-@app.post("/cases/{case_id}/save/su2_params/{side}")
-def save_su2_params_to_project(case_id: str, side: str):
-    """Boundary Conditions step's own Save — whatever's currently stored
-    for this side (the defaults, if the user never changed anything)."""
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    if side not in SIDES:
-        raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
-    folder = _require_project_dir(case)
-    payload = case.su2_params.get(side, SU2_PARAM_DEFAULTS)
-    path = folder / f"{side}_su2_params.json"
-    path.write_text(json.dumps(payload, indent=2))
-    return {"saved_to": str(path)}
-
-
-@app.post("/cases/{case_id}/save/cfd_results/{side}")
-def save_cfd_results_to_project(case_id: str, side: str):
-    """CFD Computation step's own Save — the post-processed hemodynamic
-    result (TAWSS/OSI/RRT/pressure + geometry, from
-    server/su2_postprocess.py) plus the full per-frame WSS/pressure time
-    series, so reopening this project later can drive CFDResultsView's
-    instantaneous-frame scrubbing (see /projects/open) without re-running
-    the actual CFD solve — unlike surface/mesh, which rebuild in seconds
-    and are deliberately *not* persisted this way, a real pulsatile solve
-    is minutes of mpirun+pysu2 compute, worth not repeating."""
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    if side not in SIDES:
-        raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
-    job = case.su2_postprocess_jobs.get(side)
-    if not job or job.get("state") != "done":
-        raise HTTPException(
-            status_code=404,
-            detail="no finished CFD results for this side — run CFD and View Results first",
-        )
-    folder = _require_project_dir(case)
-    result_path = folder / f"{side}_cfd_results.json"
-    result_path.write_text(json.dumps(job["result"], indent=2))
-    frames_path = folder / f"{side}_cfd_frames.npz"
-    np.savez_compressed(
-        frames_path,
-        wss_mag_pa=job["frames"]["wss_mag_pa"],
-        pressure_pa=job["frames"]["pressure_pa"],
-    )
-    return {"saved_to": [str(result_path), str(frames_path)]}
-
-
-class OpenProjectRequest(BaseModel):
-    path: str
-
-
-@app.post("/projects/open")
-def open_project(req: OpenProjectRequest):
-    """Reopens a previously-saved project folder: reloads the same DICOM
-    series fresh (the array itself is never saved to the project folder
-    — far too large, and trivially reproducible from the same source
-    files) into a brand-new in-memory CaseState, then restores whatever
-    per-side centerline/segmentation files that folder has (written by
-    the /save/* endpoints). Deliberately does *not* restore a saved
-    surface.stl or mesh .vtu/.vtp — both rebuild from the restored
-    segmentation in a couple of seconds with today's pipeline, and doing
-    that instead of deserializing a possibly-stale cached surface means
-    "Build Surface"/"Build SU2 Mesh" after reopening always reflects
-    whatever the current code actually produces, not whatever it
-    produced when the project was last saved."""
-    folder = Path(req.path)
-    manifest_path = folder / "project.json"
-    if not manifest_path.exists():
-        raise HTTPException(
-            status_code=400,
-            detail="no project.json here — this doesn't look like a project folder saved by this app",
-        )
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"could not read project.json: {e}")
-
-    source_path = manifest.get("source_path")
-    if not source_path:
-        raise HTTPException(status_code=400, detail="project.json is missing source_path")
-
-    case, info = _load_dicom_case(source_path, manifest.get("series_uid"))
-    case.project_dir = str(folder)
-
-    restored = {}
-    for side in SIDES:
-        side_restored = {"centerline": [], "segmentation": []}
-
-        centerline_path = folder / f"{side}_centerline.json"
-        if centerline_path.exists():
-            try:
-                data = json.loads(centerline_path.read_text())
-                for branch in BRANCHES:
-                    branch_data = data.get(branch) or {}
-                    if branch_data.get("control_points"):
-                        case.control_points[(side, branch)] = branch_data["control_points"]
-                    if branch_data.get("centerline_points"):
-                        case.centerline_points[(side, branch)] = branch_data["centerline_points"]
-                        side_restored["centerline"].append(branch)
-            except Exception as e:
-                log.warning("failed to restore %s centerline from %s: %s", side, centerline_path, e)
-
-        segmentation_path = folder / f"{side}_segmentation.json"
-        if segmentation_path.exists():
-            try:
-                data = json.loads(segmentation_path.read_text())
-                for branch in BRANCHES:
-                    series = data.get(branch) or []
-                    if not series:
-                        continue
-                    # contour_mm/point_mm were saved as *absolute* world-mm
-                    # at segmentation time (origin_mm + voxel*spacing with
-                    # whatever origin that session's DICOM load resolved
-                    # to). A later reload that resolves to a different
-                    # origin_mm — e.g. an older save from before a
-                    # since-fixed slice-ordering bug, or any other reason
-                    # the same series loads with a shifted origin — makes
-                    # that saved geometry silently land tens to hundreds
-                    # of mm away from the freshly-restored path, even
-                    # though the raw voxel-index path itself still looks
-                    # fine (CONFIRMED on a real project: the 3D preview's
-                    # wall contours rendered ~470mm from the path with no
-                    # error anywhere). Cross-check the first contour's own
-                    # centroid against path_series's fresh point_mm for
-                    # that same index, computed from the centerline just
-                    # restored above (same origin_mm this reload actually
-                    # has) — if they don't land within a generous margin
-                    # of each other, this branch's saved segmentation is
-                    # stale and must be re-run, not silently trusted.
-                    centerline = case.centerline_points.get((side, branch))
-                    is_stale = False
-                    if centerline and len(centerline) > 1:
-                        fresh_series = path_series.build_series(centerline, case.spacing_mm, case.origin_mm)
-                        first_idx, first_point = next(
-                            ((i, p) for i, p in enumerate(series) if p.get("contour_mm")), (None, None)
-                        )
-                        if first_point is not None and first_idx is not None and first_idx < len(fresh_series):
-                            fresh_pt = np.asarray(fresh_series[first_idx]["point_mm"])
-                            saved_centroid = np.asarray(first_point["contour_mm"]).mean(axis=0)
-                            if np.linalg.norm(fresh_pt - saved_centroid) > 20.0:
-                                is_stale = True
-                    if is_stale:
-                        log.warning(
-                            "discarding stale %s/%s segmentation on restore — saved contour_mm "
-                            "doesn't match the freshly-reloaded DICOM's own origin_mm; re-run "
-                            "Segment Along Path for this branch", side, branch,
-                        )
-                        continue
-                    case.segmentation_series[(side, branch)] = series
-                    side_restored["segmentation"].append(branch)
-            except Exception as e:
-                log.warning("failed to restore %s segmentation from %s: %s", side, segmentation_path, e)
-
-        su2_params_path = folder / f"{side}_su2_params.json"
-        if su2_params_path.exists():
-            try:
-                case.su2_params[side] = json.loads(su2_params_path.read_text())
-                side_restored["su2_params"] = True
-            except Exception as e:
-                log.warning("failed to restore %s su2_params from %s: %s", side, su2_params_path, e)
-
-        # Unlike surface/mesh (cheap to rebuild, so deliberately not
-        # persisted), a saved CFD result *is* restored directly into
-        # su2_postprocess_jobs — re-deriving it means re-running the
-        # actual pulsatile solve, minutes of real compute, not something
-        # reopening a project should force.
-        cfd_result_path = folder / f"{side}_cfd_results.json"
-        cfd_frames_path = folder / f"{side}_cfd_frames.npz"
-        if cfd_result_path.exists() and cfd_frames_path.exists():
-            try:
-                result = json.loads(cfd_result_path.read_text())
-                frames_npz = np.load(cfd_frames_path)
-                case.su2_postprocess_jobs[side] = {
-                    "state": "done",
-                    "result": result,
-                    "frames": {
-                        "wss_mag_pa": frames_npz["wss_mag_pa"],
-                        "pressure_pa": frames_npz["pressure_pa"],
-                    },
-                }
-                side_restored["cfd_results"] = True
-            except Exception as e:
-                log.warning("failed to restore %s CFD results from %s: %s", side, cfd_result_path, e)
-
-        side_restored["surface_file_exists"] = (folder / f"{side}_surface.stl").exists()
-        side_restored["mesh_files_exist"] = (folder / f"{side}_mesh.vtu").exists()
-        restored[side] = side_restored
-
-    info["project_dir"] = case.project_dir
-    info["restored"] = restored
-    return info
+app.include_router(projects.router)
+app.include_router(storage.router)

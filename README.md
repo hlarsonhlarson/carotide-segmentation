@@ -1,114 +1,85 @@
-# Carotid segmentation (CCA / ICA / ECA) via TotalSegmentator + rule-based post-processing
+# Carotid Workbench
 
-## Why this exists
+Веб-приложение для работы с сонными артериями: **DICOM → пути → контуры → поверхность → расчётная сетка → CFD**.
 
-TotalSegmentator does **not** segment all three carotid segments out of the box:
+React + TypeScript + Three.js в браузере, Python/FastAPI для обработки изображений. Всё приложение собирается и запускается через Docker Compose; Swift не требуется. Исходный `CarotidSegApp/` оставлен как историческая нативная версия.
 
-| Segment | TotalSegmentator support |
-|---|---|
-| Common carotid artery (CCA) | `total` task, classes `common_carotid_artery_left/right` |
-| Internal carotid artery (ICA) | `headneck_bones_vessels` task, classes `internal_carotid_artery_left/right` |
-| External carotid artery (ECA) | **not present in any TotalSegmentator task** |
+## Запуск
 
-(Confirmed directly against the installed `TotalSegmentator==2.16.0` class maps in this env — not from
-memory/docs, which can drift between versions.)
+Нужен Docker Desktop (или Docker Engine + Compose).
 
-So this pipeline:
-1. Runs the two open-source TotalSegmentator tasks above to get trusted CCA and ICA seed masks (no
-   license key needed — both tasks are Apache-2.0).
-2. Reconstructs the missing ECA, and refines all three segments to native CT resolution, using a
-   rule-based vessel-tree analysis: Frangi vesselness filtering → connect CCA+ICA into one lumen mask →
-   skeletonize → find the real bifurcation in the centerline graph → label the three branches →
-   propagate those labels back to a full-resolution volumetric mask.
-
-## Status
-
-The image-processing logic (bifurcation detection, cycle-artifact cleanup at the junction, branch
-classification, volumetric label propagation, left/right merging, NIfTI I/O with orientation handling)
-is implemented and validated against synthetic Y-shaped vessel geometry (see reasoning below) — the
-algorithm is verified correct on controlled data. **It has not yet been run on a real CT angiography
-case**, since none was available in this environment. Before trusting output clinically or for
-downstream modeling (e.g. CFD, stenosis measurement), run it on a handful of your own cases and check
-the QA numbers in `summary.json` plus a visual review in ITK-SNAP / 3D Slicer / your SimVascular
-workflow.
-
-## Setup
-
-You already have a `carotid` conda env with everything needed (`TotalSegmentator`, `torch`, `nibabel`,
-`scikit-image`, `scipy`, `networkx`, `dicom2nifti`, `SimpleITK`, `nnunetv2`). Nothing new to install.
-
-```bash
-conda activate carotid
+```sh
+mkdir -p data/dicom data/projects
+# Скопируйте исследования в data/dicom/<study>/
+docker compose up -d --build
 ```
 
-First run of each TotalSegmentator task downloads its model weights automatically (needs internet
-once, then cached).
+Открыть http://localhost:8080. Снимки подключены только для чтения; проекты сохраняются на хосте в `data/projects` и переживают пересоздание контейнеров.
 
-## Usage
+Для своих папок создайте `.env`:
 
-```bash
-python run_batch.py --input /path/to/cases --output /path/to/results
+```dotenv
+DICOM_DIR=/absolute/path/to/dicom
+PROJECTS_DIR=/absolute/path/to/projects
+WEB_PORT=8080
 ```
 
-`--input` is a folder where each case is either:
-- a single `case.nii.gz` file, or
-- a subfolder of DICOM files for that case's CT series (converted via `dicom2nifti` automatically).
+В интерфейсе можно выбрать папку из подключённых каталогов. Пути `/data/dicom/...` и `/data/projects/...` относятся к контейнеру. Для нового проекта выбирайте отдельную пустую подпапку. Существующий проект открывается кнопкой «Открыть проект».
 
-Output per case: `<output>/<case_id>/carotid_segments.nii.gz`, a single multilabel NIfTI:
+## Работа
 
+- Выберите DICOM-серию, сторону и ветвь CCA→ICA / CCA→ECA.
+- Просматривайте аксиальные, корональные и сагиттальные срезы, меняйте окно изображения.
+- Добавляйте, перемещайте, удаляйте и переставляйте точки. Auto-Trace строит путь между двумя выбранными точками.
+- Подготовьте поперечные сечения. Доступны автоматический метод, порог, активный контур, круг и ручной многоугольник. Контуры можно обрабатывать по одному или всей серией.
+- Постройте поверхность и сетку, просмотрите их в 3D, экспортируйте STL.
+- Задайте граничные условия. При подключённом SU2 доступны запуск, отмена и обработка CFD; сохранённые результаты отображаются цветной 3D-картой.
+- «Сохранить проект» сохраняет разметку, параметры и готовые артефакты. После выбора папки ручные изменения сохраняются автоматически.
+
+Изменение пути/контуров сбрасывает зависимые результаты, изменение условий — CFD. Правая и левая стороны обрабатываются отдельно. Завершение вычисления не означает подтверждения физической достоверности.
+
+## SU2: внешняя зависимость
+
+Переданный проект зависит от кастомной сборки SU2/pysu2. Её исходников в репозитории нет. Стандартный Docker-образ запускает просмотр, сегментацию и построение сетки; CFD честно отображается как недоступный, пока не подключена совместимая **Linux-сборка** solver. macOS-библиотека pysu2 не работает в Linux-контейнере.
+
+Соберите производный backend-образ с подходящими SU2/pysu2, Python и MPI, задайте `CAROTID_SU2_BIN` и `CAROTID_MPI_PYTHON` в окружении backend. `mpirun` должен быть в PATH. Полный расчёт требует отдельного тестирования совместимости и физики; численные настройки не менялись при переносе UI.
+
+## Проверки
+
+```sh
+docker compose run --rm backend env -u CAROTID_DICOM_ROOT -u CAROTID_PROJECTS_ROOT python -m pytest -q
+cd frontend
+npm ci
+npm run build
+npm test
 ```
-1 = CCA right   2 = CCA left
-3 = ICA right   4 = ICA left
-5 = ECA right   6 = ECA left
+
+Локальная разработка UI: `npm run dev` (проксирует `/api` на `127.0.0.1:8000`). Контейнерный frontend проксирует API через Nginx; backend наружу не опубликован. Сервис предназначен для одного локального пользователя, без нескольких Uvicorn workers.
+
+## Проекты и миграция
+
+Формат v2 использует атомарный `project.json`, версии входов и отдельные неизменяемые файлы результатов. Старые файлы автоматически не удаляются. DICOM остаётся в исходной папке; перемещение снимков потребует корректировки пути в копии проекта.
+
+Для старого неверсированного проекта:
+
+```sh
+docker compose run --rm backend python -m server.migrate_project /data/projects/old /data/projects/new
 ```
 
-`<output>/summary.json` has per-case, per-side QA: whether the bifurcation was resolved, segment
-volumes, and connectivity checks (each label should be exactly 1 connected component — if
-`*_multi_component: true`, review that case).
+Исходник сохраняется. Импортируются разметка и параметры; старые CFD-результаты остаются в старой папке, поскольку их соответствие входным данным не доказано. Импортированную разметку нужно сверить со снимками.
 
-Options:
-- `--device {gpu,cpu,mps}` — default auto-detects (this Mac has MPS available).
-- `--cap-ica-at-skull-base` — optionally trims the ICA at the styloid-process landmark + margin. Off
-  by default, since `headneck_bones_vessels`'s ICA model has its own learned extent and this landmark
-  is only an approximation of true skull-base (carotid canal) entry. Turn on and tune
-  `--skull-base-margin-mm` if you find the raw ICA output runs further than you want.
-- `--keep-intermediate` — keeps the raw per-class TotalSegmentator outputs instead of discarding them.
+Архитектура: `server/workflow.py` — зависимости, `server/projects.py` — сохранение, `server/storage.py` — подключённые папки; `frontend/src` — компоненты рабочего процесса. Алгоритмы находятся в `server/` и `carotid_seg/`.
 
-## Requirements on the input data
+Ограничения: произвольная ориентация DICOM ещё не поддерживается внутренней моделью координат; клиническая точность сегментации и физическая достоверность CFD не подтверждаются инженерными тестами. План проверки — [docs/validation.md](docs/validation.md).
 
-- **Contrast-enhanced CT angiography (CTA)**, not plain CT — the whole approach (adaptive HU banding,
-  Frangi vesselness) depends on the carotid lumen being bright relative to surrounding tissue. Plain CT
-  will give unreliable results and there's no way around that without contrast.
-- FOV should cover from below the CCA origin (roughly aortic-arch level) up through the skull base.
-  If the scan doesn't include neck vertebrae C1–C7, `summary.json`'s `vertebrae_found` list for that
-  case will be short/empty — a quick way to flag insufficient FOV.
+### Сквозной браузерный тест
 
-## Known limitations / tuning knobs
+Синтетические данные можно создать в новой папке командой `python tests/create_demo.py data/dicom/synthetic-demo` (нужны NumPy и pydicom). Затем при работающем Docker-приложении:
 
-- **Bifurcation ambiguity in tortuous or diseased vessels.** The rule (one branch continues to the
-  known ICA seed, one to the known CCA seed, the rest is ECA) assumes a fairly standard bifurcation
-  anatomy. Severe tortuosity, occlusion, or a very high/low bifurcation may make it fail — in that case
-  the case falls back to just the raw TotalSegmentator CCA/ICA masks with `bifurcation_found: false`
-  and no ECA, rather than guessing.
-- **HU band and Frangi threshold are adaptive but not bulletproof** — see `vesselness.py`,
-  `adaptive_lumen_hu_band()` and `frangi_thresh` in `vessel_lumen_mask()`. If a case's ECA comes out
-  under- or over-segmented, that threshold and the morphological closing radius (`ball(1)`) are the
-  first things to tune.
-- **Bifurcation-apex convention**: the single voxel where CCA/ICA/ECA meet is counted as the end of the
-  CCA (a convention, not a universal standard — clinically the "carotid bulb" spans this zone loosely).
-  Change the `label_vol[bn] = 1` line in `treeanalysis.py` if you need a different convention.
-- No fine-tuned model is involved — if this rule-based approach isn't accurate enough after tuning,
-  the natural next step (given `nnunetv2` is already in this env) is to hand-label a training set from
-  this pipeline's output (after manual correction) and fine-tune a dedicated 3-class carotid model.
-
-## Layout
-
+```sh
+cd frontend
+npx playwright install chromium
+npx playwright test e2e --workers=1
 ```
-carotid_seg/
-  totalseg_steps.py   # TotalSegmentator task wrappers (CCA, ICA, styloid, C1-C7 landmarks)
-  vesselness.py        # per-scan adaptive HU banding + Frangi vessel lumen extraction
-  treeanalysis.py       # skeleton graph, cycle-artifact cleanup, bifurcation search, branch labeling
-  volumize.py            # label propagation back to full volume + QA metrics
-  pipeline.py             # per-case orchestration, left/right merge, NIfTI I/O
-run_batch.py              # CLI entrypoint
-```
+
+Тест создаёт отдельный проект `e2e-*`, проверяет загрузку снимков, путь, контуры, поверхность, тетраэдрическую сетку, сохранение, открытие, 3D-просмотр и сброс устаревших результатов. Эти проекты и исходные синтетические снимки не входят в Git.

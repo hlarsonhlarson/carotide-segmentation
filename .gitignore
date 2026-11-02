@@ -1,0 +1,28 @@
+# Local build and runtime artifacts
+.DS_Store
+.build/
+.swiftpm/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+graphify-out/
+_skipped.node
+_skipped.face
+# Local configuration and studies
+.env
+.env.*
+!.env.example
+studies/
+
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+data/
+test-results/
+playwright-report/

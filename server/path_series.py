@@ -6,6 +6,7 @@ and reasoned about for this same purpose), operating on world-mm points
 instead of the SimVascular-specific path object.
 """
 import math
+from .coordinates import voxel_to_world
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -15,9 +16,7 @@ SMOOTHING_SIGMA_POINTS = 3.0
 
 
 def voxel_path_to_world_mm(path_voxel, spacing_mm, origin_mm):
-    spacing = np.asarray(spacing_mm)
-    origin = np.asarray(origin_mm)
-    return [list(origin + np.asarray(p) * spacing) for p in path_voxel]
+    return voxel_to_world(path_voxel, spacing_mm, origin_mm).tolist()
 
 
 def smooth_path(points_mm, sigma_points: float = SMOOTHING_SIGMA_POINTS):

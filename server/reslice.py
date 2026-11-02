@@ -7,6 +7,7 @@ axis-aligned in general.
 """
 import numpy as np
 from scipy import ndimage as ndi
+from .coordinates import world_to_voxel
 
 
 def _orthonormal_in_plane_axes(tangent_mm):
@@ -42,7 +43,7 @@ def sample_oblique_slice(array: np.ndarray, spacing_mm, origin_mm, point_mm, tan
 
     half = size_px / 2.0
     offsets = (np.arange(size_px) - half + 0.5) * px_spacing_mm  # pixel-center offsets
-    grid_origin_world_mm = point - half * px_spacing_mm * u - half * px_spacing_mm * v
+    grid_origin_world_mm = point + offsets[0] * u + offsets[0] * v
 
     # World-mm position of every grid cell: point + i*px*u + j*px*v
     ii, jj = np.meshgrid(offsets, offsets)  # jj varies along rows (v), ii along cols (u)
@@ -51,7 +52,7 @@ def sample_oblique_slice(array: np.ndarray, spacing_mm, origin_mm, point_mm, tan
     # World mm -> voxel index, same convention used throughout this codebase
     # (meshing.py, mra_pipeline.py): voxel = (world - origin) / spacing, no
     # rotation component.
-    voxel = (world - np.asarray(origin_mm)) / np.asarray(spacing_mm)
+    voxel = world_to_voxel(world, spacing_mm, origin_mm)
     coords = [voxel[..., 0], voxel[..., 1], voxel[..., 2]]  # z, y, x
 
     slice_2d = ndi.map_coordinates(array, coords, order=1, mode="constant", cval=float(array.min()))

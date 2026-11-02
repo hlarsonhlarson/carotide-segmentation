@@ -1,5 +1,6 @@
 """In-memory case registry. One process, one user — no DB needed yet."""
 import uuid
+import threading
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -79,6 +80,14 @@ class CaseState:
     # losing the in-memory case (a backend restart) doesn't mean losing
     # already-saved progress, only progress never explicitly saved.
     project_dir: str | None = None
+    project_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    lock: object = field(default_factory=threading.RLock, repr=False)
+    revisions: dict = field(default_factory=lambda: {
+        side: {"geometry": 0, "params": 0} for side in ("left", "right")
+    })
+    stale: dict = field(default_factory=lambda: {side: set() for side in ("left", "right")})
+    saved_artifacts: dict = field(default_factory=dict)
+    project_warnings: list = field(default_factory=list)
 
 
 _CASES: dict[str, CaseState] = {}
