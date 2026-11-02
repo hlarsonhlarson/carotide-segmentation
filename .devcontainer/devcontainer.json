@@ -1,0 +1,14 @@
+{
+  "name": "Carotid demo",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:4": {}
+  },
+  "hostRequirements": {"cpus": 4, "memory": "8gb", "storage": "32gb"},
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {"label": "Carotid demo", "onAutoForward": "openBrowser", "protocol": "http"}
+  },
+  "postStartCommand": "bash .devcontainer/start-demo.sh",
+  "remoteUser": "vscode"
+}
