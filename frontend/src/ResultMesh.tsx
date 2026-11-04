@@ -15,7 +15,7 @@ export function ResultMesh({
     const parent = host.current;
     if (!parent) return;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color("#101925");
+    scene.background = new THREE.Color("#344152");
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute(
       "position",
