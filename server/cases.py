@@ -23,6 +23,7 @@ class CaseState:
     # reopening a saved project reloads the exact same series rather
     # than re-prompting or guessing.
     series_uid: str | None = None
+    display_flips: dict = field(default_factory=dict)
     # {(side, branch): [[z,y,x], ...]} — dense auto-stitched path, voxel
     # coords, rebuilt from control_points whenever one is added/moved/deleted.
     centerline_points: dict = field(default_factory=dict)

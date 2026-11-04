@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { request } from "./Segmentation";
+import { useImageNavigation } from "./useImageNavigation";
 import { PathPreview, branches, branchColors } from "./PathPreview";
 export type Axis = "axial" | "coronal" | "sagittal";
 export function voxelAt(
@@ -50,12 +51,19 @@ function SlicePane({
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const content = useRef<SVGGElement>(null);
-  const [zoom, setZoom] = useState(1);
   const dimension = axes.indexOf(axis);
   const rows = axis === "axial" ? study.shape[1] : study.shape[0];
   const cols = axis === "sagittal" ? study.shape[1] : study.shape[2];
   const sx = study.spacing_mm[axis === "sagittal" ? 1 : 2],
     sy = study.spacing_mm[axis === "axial" ? 1 : 0];
+  const flips = study.display_flips?.[axis];
+  const navigation = useImageNavigation(
+    cols * sx,
+    rows * sy,
+    flips?.x,
+    flips?.y,
+  );
+  const { zoom } = navigation;
   useEffect(() => {
     const element = viewport.current;
     function wheel(e: WheelEvent) {
@@ -92,17 +100,31 @@ function SlicePane({
         <span className="pane-tools">
           <button
             aria-label={`Уменьшить: ${axisNames[axis]}`}
-            disabled={zoom <= 1}
-            onClick={() => setZoom((z) => Math.max(1, z / 1.4))}
+            disabled={zoom <= 0.5}
+            onClick={() => navigation.zoomBy(1 / 1.4)}
           >
             −
           </button>
           <button
             aria-label={`Увеличить: ${axisNames[axis]}`}
-            disabled={zoom >= 8}
-            onClick={() => setZoom((z) => Math.min(8, z * 1.4))}
+            disabled={zoom >= 10}
+            onClick={() => navigation.zoomBy(1.4)}
           >
             +
+          </button>
+          <button
+            aria-label={`Перевернуть: ${axisNames[axis]}`}
+            title="Повернуть изображение на 180°"
+            onClick={navigation.rotate}
+          >
+            ↻
+          </button>
+          <button
+            aria-label={`Вписать: ${axisNames[axis]}`}
+            title="Сбросить масштаб, сдвиг и поворот"
+            onClick={navigation.reset}
+          >
+            ⤢
           </button>
           <span>
             {index + 1} / {study.shape[dimension]}
@@ -113,7 +135,9 @@ function SlicePane({
         <svg
           viewBox={`0 0 ${cols * sx} ${rows * sy}`}
           aria-label={`${axisNames[axis]}: разметка`}
+          {...navigation.handlers}
           onClick={(e) => {
+            if (e.button !== 0 || !navigation.canClick()) return;
             const matrix = content.current?.getScreenCTM();
             if (!matrix) return;
             const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(
@@ -125,10 +149,7 @@ function SlicePane({
               onPoint(voxelAt(axis, index, row, col, study.shape));
           }}
         >
-          <g
-            ref={content}
-            transform={`translate(${(cols * sx) / 2} ${(rows * sy) / 2}) scale(${zoom}) translate(${(-cols * sx) / 2} ${(-rows * sy) / 2})`}
-          >
+          <g ref={content} transform={navigation.transform}>
             <image
               href={`/api${base}/slice?axis=${axis}&index=${index}&wl=${wl}&ww=${ww}`}
               width={cols * sx}
@@ -323,6 +344,7 @@ export function PathEditor({
             points={points}
             paths={paths}
             spacing={study.spacing_mm}
+            displayFlips={study.display_flips}
             side={side}
           />
         </div>
@@ -402,7 +424,7 @@ export function PathEditor({
                     ? "Выберите начало пути"
                     : mode === "points"
                       ? "Нажмите на сосуд, чтобы добавить точку"
-                      : "Колесо мыши — листать срезы. Выберите режим разметки для добавления точек."}
+                      : "Колесо — срезы · Правая кнопка + вверх/вниз — масштаб · Средняя кнопка — перемещение"}
           </p>
           <div className="button-row">
             <button className="primary" onClick={() => onStep(2)}>

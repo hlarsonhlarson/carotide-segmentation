@@ -147,7 +147,9 @@ def _load_dicom_case(path: str, series_uid: str | None):
             if len(available) != 1:
                 raise HTTPException(400, "Choose a DICOM series explicitly")
             series_uid = available[0]["series_uid"]
-        array, spacing_mm, origin_mm, modality = dicom_io.load_series(path, series_uid)
+        array, spacing_mm, origin_mm, modality, flips = dicom_io.load_series(
+            path, series_uid, include_display_flips=True
+        )
     except HTTPException:
         raise
     except FileNotFoundError as e:
@@ -159,6 +161,7 @@ def _load_dicom_case(path: str, series_uid: str | None):
         raise HTTPException(status_code=400, detail=f"could not load DICOM series: {e}")
 
     case = cases.create(array, spacing_mm, origin_mm, modality, str(Path(path).expanduser().resolve()), series_uid=series_uid)
+    case.display_flips = flips
     wl, ww = case.default_window
     info = {
         "case_id": case.case_id,
@@ -167,6 +170,7 @@ def _load_dicom_case(path: str, series_uid: str | None):
         "origin_mm": origin_mm.tolist(),
         "modality": modality,
         "default_window": {"wl": wl, "ww": ww},
+        "display_flips": case.display_flips,
     }
     return case, info
 
@@ -192,6 +196,7 @@ def get_meta(case_id: str):
         "modality": case.modality,
         "source_path": case.source_path,
         "default_window": {"wl": wl, "ww": ww},
+        "display_flips": case.display_flips,
     }
 
 
@@ -212,6 +217,9 @@ def get_slice(case_id: str, axis: str, index: int, wl: float | None = None, ww: 
     if axis_i == 0:
         plane = case.array[index, :, :]
     elif axis_i == 1:
+        # The PNG convention reverses voxel Z. For descending acquisitions,
+        # display_flips metadata tells the viewer to correct the display
+        # without changing stored voxel coordinates.
         # Coronal/sagittal planes have z (axis 0, increasing toward
         # superior — established convention throughout this codebase, see
         # mra_pipeline.py) as their row axis. Row 0 is the TOP of the

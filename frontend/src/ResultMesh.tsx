@@ -52,6 +52,11 @@ export function ResultMesh({
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     parent.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.DOLLY,
+    };
     controls.update();
     const resize = new ResizeObserver(() => {
       renderer.setSize(parent.clientWidth, 420);

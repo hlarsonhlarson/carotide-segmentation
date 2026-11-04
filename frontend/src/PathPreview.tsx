@@ -11,10 +11,12 @@ export function PathPreview({
   points,
   spacing,
   side,
+  displayFlips,
 }: {
   paths: Record<string, number[][]>;
   points: Record<string, number[][]>;
   spacing: number[];
+  displayFlips?: Record<string, { x: boolean; y: boolean }>;
   side: string;
 }) {
   const host = useRef<HTMLDivElement>(null);
@@ -36,13 +38,18 @@ export function PathPreview({
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     parent.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.DOLLY,
+    };
     const group = new THREE.Group();
     scene.add(group);
     const vector = (p: number[]) =>
       new THREE.Vector3(
-        p[2] * spacing[2],
-        p[0] * spacing[0],
-        p[1] * spacing[1],
+        p[2] * spacing[2] * (displayFlips?.axial?.x ? -1 : 1),
+        p[0] * spacing[0] * (displayFlips?.coronal?.y ? -1 : 1),
+        p[1] * spacing[1] * (displayFlips?.axial?.y ? -1 : 1),
       );
     branches.forEach((branch) => {
       const key = side + ":" + branch;
@@ -113,7 +120,7 @@ export function PathPreview({
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, [paths, points, spacing, side]);
+  }, [paths, points, spacing, side, displayFlips]);
   const count = branches.reduce(
     (sum, b) => sum + (points[side + ":" + b]?.length || 0),
     0,

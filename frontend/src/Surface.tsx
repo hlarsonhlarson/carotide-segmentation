@@ -34,6 +34,11 @@ export function Surface({
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     parent.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.DOLLY,
+    };
     scene.add(new THREE.HemisphereLight(0xffffff, 0x36495c, 3));
     const light = new THREE.DirectionalLight(0xffffff, 3);
     light.position.set(1, 2, 3);

@@ -703,3 +703,17 @@ dialog::backdrop {
     margin-left: 0;
   }
 }
+.slice-viewport svg {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.pane-title {
+  flex-wrap: wrap;
+}
+
+.pane-tools {
+  flex-wrap: wrap;
+  max-width: 100%;
+  min-width: 0;
+}

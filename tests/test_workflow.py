@@ -76,7 +76,7 @@ def test_round_trip_and_reopen_reuses_case(client, case, tmp_path, monkeypatch):
     assert client.post(f'/cases/{case.case_id}/save/project').status_code == 200
     before = projects.snapshot(case)
     cases._CASES.clear()
-    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *args: (case.array, case.spacing_mm, case.origin_mm, 'CT'))
+    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *args, **kwargs: (case.array, case.spacing_mm, case.origin_mm, 'CT', {}))
     result = client.post('/projects/open', json={'path': str(tmp_path)})
     assert result.status_code == 200, result.text
     restored = cases.get(result.json()['case_id'])
@@ -175,7 +175,7 @@ def test_migration_preserves_original_and_requires_review(client, case, tmp_path
     (source / 'project.json').write_text(json.dumps({'source_path': case.source_path, 'series_uid': case.series_uid}))
     (source / 'right_centerline.json').write_text(json.dumps({'cca_ica': {'control_points': [[1, 2, 3]], 'centerline_points': [[1, 2, 3], [6, 2, 3]]}}))
     original = (source / 'project.json').read_bytes()
-    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *a: (case.array, case.spacing_mm, case.origin_mm, 'CT'))
+    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *a, **kwargs: (case.array, case.spacing_mm, case.origin_mm, 'CT', {}))
     destination = tmp_path / 'new'
     migrate(source, destination)
     assert (source / 'project.json').read_bytes() == original
