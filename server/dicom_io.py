@@ -111,7 +111,25 @@ def _read_image(files: list[str]):
     return sitk.ReadImage(files[0])
 
 
-def load_series(path_str: str, series_uid: str | None = None):
+def display_flips(direction):
+    """Correct acquisition-axis reversals without changing stored voxel indices.
+
+    ITK direction is row-major XYZ in patient LPS. PNG coronal/sagittal
+    rows already reverse voxel Z; that assumes Z increases superiorly.
+    Flip the display when an acquisition axis has the opposite direction.
+    This does not resample oblique acquisitions into anatomical planes.
+    """
+    matrix = np.asarray(direction).reshape(3, 3)
+    reversed_axes = [bool(matrix[i, i] < 0) for i in range(3)]
+    x, y, z = reversed_axes
+    return {
+        "axial": {"x": x, "y": y},
+        "coronal": {"x": x, "y": z},
+        "sagittal": {"x": y, "y": z},
+    }
+
+
+def load_series(path_str: str, series_uid: str | None = None, *, include_display_flips=False):
     """Returns (array, spacing_mm, origin_mm, modality) for one series in the
     DICOM study at `path_str` (a folder). array axis order is (z, y, x),
     matching SimpleITK's GetArrayFromImage convention used throughout this
@@ -145,7 +163,10 @@ def load_series(path_str: str, series_uid: str | None = None):
     origin_mm = np.asarray(img.GetOrigin())[::-1]
     modality = chosen["modality"] or "MR"
 
-    return arr, spacing_mm, origin_mm, modality
+    result = (arr, spacing_mm, origin_mm, modality)
+    if include_display_flips:
+        return (*result, display_flips(img.GetDirection()))
+    return result
 
 
 def to_nifti_tempfile(array: np.ndarray, spacing_mm, origin_mm) -> Path:

@@ -46,72 +46,6 @@ enum CFDColormap {
     static let dimmedGray = SCNVector3(0.22, 0.24, 0.27)
 }
 
-/// world (x,y,z) mm, in this app's established *surface* convention (see
-/// su2_export.py's own _xyz() docstring — the reverse of the app's other
-/// [z,y,x] world-mm convention) -> SceneKit (x,z,y), matching exactly how
-/// parseBinarySTL's own inline swap places every other surface this app
-/// renders into the same scene space.
-private func xyzMMToScene(_ p: [Double]) -> SCNVector3 {
-    SCNVector3(Float(p[0]), Float(p[2]), Float(p[1]))
-}
-
-/// Builds a per-vertex-colored wall mesh: `values[i]` colors `points[i]`
-/// via CFDColormap, mapped across `range`; any point outside
-/// `thresholdRange` (when given) renders as CFDColormap.dimmedGray
-/// instead, so a threshold filter reads as "lit up vs. dimmed" rather
-/// than needing a second geometry or a discard shader.
-func buildScalarColoredMesh(
-    pointsMM: [[Double]], triangles: [[Int]], values: [Double],
-    range: ClosedRange<Double>, thresholdRange: ClosedRange<Double>?
-) -> SCNGeometry {
-    var vertices: [SCNVector3] = []
-    vertices.reserveCapacity(pointsMM.count)
-    var colorComponents: [Float] = []
-    colorComponents.reserveCapacity(pointsMM.count * 4)
-
-    let span = range.upperBound - range.lowerBound
-    for (i, p) in pointsMM.enumerated() {
-        vertices.append(xyzMMToScene(p))
-        let v = i < values.count ? values[i] : range.lowerBound
-        let inBand = thresholdRange.map { $0.contains(v) } ?? true
-        let rgb = inBand ? CFDColormap.color(span > 0 ? (v - range.lowerBound) / span : 0) : CFDColormap.dimmedGray
-        colorComponents.append(contentsOf: [Float(rgb.x), Float(rgb.y), Float(rgb.z), 1.0])
-    }
-
-    var indices: [Int32] = []
-    indices.reserveCapacity(triangles.count * 3)
-    for tri in triangles {
-        indices.append(Int32(tri[0]))
-        indices.append(Int32(tri[1]))
-        indices.append(Int32(tri[2]))
-    }
-
-    let vertexSource = SCNGeometrySource(vertices: vertices)
-    let colorData = Data(bytes: colorComponents, count: colorComponents.count * MemoryLayout<Float>.size)
-    let colorSource = SCNGeometrySource(
-        data: colorData, semantic: .color, vectorCount: vertices.count,
-        usesFloatComponents: true, componentsPerVector: 4,
-        bytesPerComponent: MemoryLayout<Float>.size, dataOffset: 0,
-        dataStride: MemoryLayout<Float>.size * 4
-    )
-    let indexData = Data(bytes: indices, count: indices.count * MemoryLayout<Int32>.size)
-    let element = SCNGeometryElement(
-        data: indexData, primitiveType: .triangles,
-        primitiveCount: indices.count / 3, bytesPerIndex: MemoryLayout<Int32>.size
-    )
-
-    let geometry = SCNGeometry(sources: [vertexSource, colorSource], elements: [element])
-    let material = SCNMaterial()
-    // White diffuse + the .color vertex source: SceneKit modulates the
-    // vertex color by this, so leaving it white shows the vertex color
-    // unmodified rather than tinting it.
-    material.diffuse.contents = NSColor.white
-    material.lightingModel = .physicallyBased
-    material.isDoubleSided = true
-    geometry.materials = [material]
-    return geometry
-}
-
 /// The six hemodynamic fields this viewer can color/threshold by — the
 /// derived ones (TAWSS/OSI/RRT/mean pressure) come straight off the main
 /// /su2_postprocess/result payload; the instantaneous ones are fetched
@@ -153,6 +87,9 @@ final class CFDResultsLoader: ObservableObject {
     @Published var frameValues: [Double]?
     @Published var isLoadingFrame = false
 
+    private(set) var wallMesh: CFDWallMesh?
+    private(set) var frameRevision = 0
+
     private let api: APIClient
     private let caseId: String
     private let side: String
@@ -167,7 +104,9 @@ final class CFDResultsLoader: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
-            result = try await api.fetchSU2PostprocessResult(caseId: caseId, side: side)
+            let loaded = try await api.fetchSU2PostprocessResult(caseId: caseId, side: side)
+            wallMesh = CFDWallMesh(pointsMM: loaded.pointsMM, triangles: loaded.triangles)
+            result = loaded
         } catch {
             loadError = "Failed to load results: \(error.localizedDescription)"
         }
@@ -178,7 +117,9 @@ final class CFDResultsLoader: ObservableObject {
         defer { isLoadingFrame = false }
         let apiField = field == .instantWSS ? "wss" : "pressure"
         do {
-            frameValues = try await api.fetchSU2PostprocessFrame(caseId: caseId, side: side, index: index, field: apiField)
+            let values = try await api.fetchSU2PostprocessFrame(caseId: caseId, side: side, index: index, field: apiField)
+            frameRevision += 1
+            frameValues = values
         } catch {
             loadError = "Failed to load frame: \(error.localizedDescription)"
         }
@@ -311,19 +252,19 @@ struct CFDResultsView: View {
         }
     }
 
+    private var valueRevision: Int { field.isInstantaneous ? loader.frameRevision : 0 }
+
     private var valueRange: ClosedRange<Double> {
-        guard let values = activeValues, let lo = values.min(), let hi = values.max(), hi > lo else {
-            return 0...1
-        }
-        return lo...hi
+        guard let mesh = loader.wallMesh, let values = activeValues else { return 0...1 }
+        return mesh.valueRange(values: values, field: field, revision: valueRevision)
     }
 
     private var coloredGeometry: SCNGeometry? {
-        guard let result = loader.result, let values = activeValues, values.count == result.pointsMM.count else { return nil }
+        guard let mesh = loader.wallMesh, let values = activeValues else { return nil }
         let band: ClosedRange<Double>? = thresholdEnabled ? thresholdLow...max(thresholdHigh, thresholdLow) : nil
-        return buildScalarColoredMesh(
-            pointsMM: result.pointsMM, triangles: result.triangles, values: values,
-            range: valueRange, thresholdRange: band
+        return mesh.geometry(
+            values: values, field: field, revision: valueRevision,
+            range: valueRange, threshold: band
         )
     }
 
@@ -441,30 +382,9 @@ struct CFDResultsView: View {
     /// excluded rather than counted whole, so this stays a lower (never
     /// an over-) estimate of the highlighted region's real area.
     private func thresholdAreaStats() -> (area: Double, fraction: Double) {
-        guard let result = loader.result, let values = activeValues, values.count == result.pointsMM.count else { return (0, 0) }
-        let lo = min(thresholdLow, thresholdHigh)
-        let hi = max(thresholdLow, thresholdHigh)
-        var total = 0.0
-        var inBand = 0.0
-        for tri in result.triangles {
-            guard tri.count == 3, tri[0] < values.count, tri[1] < values.count, tri[2] < values.count else { continue }
-            let p0 = result.pointsMM[tri[0]], p1 = result.pointsMM[tri[1]], p2 = result.pointsMM[tri[2]]
-            let a = triangleAreaMM2(p0, p1, p2)
-            total += a
-            if lo...hi ~= values[tri[0]], lo...hi ~= values[tri[1]], lo...hi ~= values[tri[2]] {
-                inBand += a
-            }
-        }
-        return (inBand, total > 0 ? inBand / total : 0)
-    }
-
-    private func triangleAreaMM2(_ a: [Double], _ b: [Double], _ c: [Double]) -> Double {
-        let u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
-        let v = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
-        let cx = u.1 * v.2 - u.2 * v.1
-        let cy = u.2 * v.0 - u.0 * v.2
-        let cz = u.0 * v.1 - u.1 * v.0
-        return 0.5 * (cx * cx + cy * cy + cz * cz).squareRoot()
+        guard let mesh = loader.wallMesh, let values = activeValues else { return (0, 0) }
+        let band = min(thresholdLow, thresholdHigh)...max(thresholdLow, thresholdHigh)
+        return mesh.thresholdArea(values: values, range: band)
     }
 
     private func paramSlider(label: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {

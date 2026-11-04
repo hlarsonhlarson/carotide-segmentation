@@ -25,6 +25,7 @@ def invalidate(case, side, stage='surface'):
         raise ValueError(stage)
     downstream = STAGES[STAGES.index(stage):]
     if 'surface' in downstream:
+        case.surface_cache.pop(side, None)
         case.built_surfaces.pop(side, None)
         case.revisions[side]['geometry'] += 1
     if 'mesh' in downstream:
