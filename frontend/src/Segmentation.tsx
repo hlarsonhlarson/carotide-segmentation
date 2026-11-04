@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { useImageNavigation } from "./useImageNavigation";
 import { SegmentationPreview } from "./SegmentationPreview";
 import { branchColors } from "./PathPreview";
-import type { SegmentationPoint } from "./segmentationGeometry";
+import type {
+  SegmentationPoint,
+  SegmentationChange,
+} from "./segmentationGeometry";
 export async function request(path: string, body?: unknown, method = "POST") {
   const response = await fetch(
     "/api" + path,
@@ -29,14 +32,17 @@ export function Segmentation({
   side,
   branch,
   study,
+  onSeriesChange,
   onError,
 }: {
   base: string;
   side: string;
   branch: string;
   study: any;
+  onSeriesChange: SegmentationChange;
   onError: (message: string) => void;
 }) {
+  const latestPoints = useRef<SegmentationPoint[]>([]);
   const [points, setPoints] = useState<SegmentationPoint[]>([]);
   const [index, setIndex] = useState(0);
   const [method, setMethod] = useState("auto");
@@ -58,16 +64,21 @@ export function Segmentation({
   const content = useRef<SVGGElement>(null);
   const route = `${base}/segment/${side}/${branch}`;
   const color = branchColors[branch];
+  function publish(next: SegmentationPoint[]) {
+    latestPoints.current = next;
+    setPoints(next);
+    onSeriesChange(base, side, branch, next);
+  }
   async function refresh() {
     const data = await request(route);
-    setPoints(data.points);
+    publish(data.points);
     setIndex((i) => Math.min(i, Math.max(0, data.points.length - 1)));
   }
   useEffect(() => {
     let active = true;
     request(route)
       .then((d) => {
-        if (active) setPoints(d.points);
+        if (active) publish(d.points);
       })
       .catch((e) => {
         if (active) onError(String(e));
@@ -109,8 +120,8 @@ export function Segmentation({
         ? { contour_px: manual }
         : { method, radius_mm: radius },
     );
-    setPoints((previous) =>
-      previous.map((p, j) =>
+    publish(
+      latestPoints.current.map((p, j) =>
         j === i
           ? {
               ...p,

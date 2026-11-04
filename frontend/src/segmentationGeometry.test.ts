@@ -20,6 +20,33 @@ const point = (z: number, radius = 2): SegmentationPoint => ({
 const convert = (p: number[]) => scenePoint(p, [0, 0, 0]);
 
 describe("segmentation wall preview", () => {
+  it("overlays world-mm contour centres on voxel paths with nonzero origin and reversed Z", () => {
+    const origin = [-120, 40, -80],
+      spacing = [0.7, 0.52, 0.52],
+      voxel = [136, 284, 186];
+    const flips = {
+      axial: { x: false, y: false },
+      coronal: { x: false, y: true },
+    };
+    const path = scenePoint(
+      voxel.map((v, i) => v * spacing[i]),
+      [0, 0, 0],
+      flips,
+    );
+    const worldCenter = voxel.map((v, i) => origin[i] + v * spacing[i]);
+    const contourCenter = scenePoint(worldCenter, origin, flips);
+    expect(path.distanceTo(contourCenter)).toBeLessThan(1e-10);
+    const ring = selectedRing(
+      { point_mm: worldCenter, tangent_mm: [1, 0, 0] },
+      3,
+      (p) => scenePoint(p, origin, flips),
+    );
+    const centre = ring
+      .reduce((sum, p) => sum.add(p), new THREE.Vector3())
+      .divideScalar(ring.length);
+    expect(centre.distanceTo(path)).toBeLessThan(1e-10);
+  });
+
   it("resamples closed rings with repeated endpoints and aligns reversed winding", () => {
     const source = point(0).contour_mm!.map(convert);
     const ring = resampleRing([...source, source[0]], 18);

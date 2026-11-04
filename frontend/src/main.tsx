@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 import { Segmentation, request } from "./Segmentation";
@@ -7,6 +7,11 @@ import { CFD } from "./CFD";
 import { Workflow } from "./Workflow";
 import { FolderPicker } from "./FolderPicker";
 import { PathEditor } from "./PathEditor";
+import {
+  segmentationKey,
+  type SegmentationPoint,
+  type SegmentationChange,
+} from "./segmentationGeometry";
 
 function App() {
   const [study, setStudy] = useState<any>(null);
@@ -20,6 +25,18 @@ function App() {
   const [message, setMessage] = useState("");
   const [loader, setLoader] = useState<"dicom" | "projects" | null>(null);
   const [step, setStep] = useState(0);
+  const [segmentations, setSegmentations] = useState<
+    Record<string, SegmentationPoint[]>
+  >({});
+  const updateSegmentation = useCallback<SegmentationChange>(
+    (base, side, branch, points) => {
+      const key = segmentationKey(base, side, branch);
+      setSegmentations((previous) =>
+        previous[key] === points ? previous : { ...previous, [key]: points },
+      );
+    },
+    [],
+  );
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     if (step) dialog.current?.showModal();
@@ -37,6 +54,7 @@ function App() {
     }
   }
   function opened(value: any) {
+    setSegmentations({});
     setStudy(value);
     setStep(0);
     setProject(value.project_dir || `/data/projects/study-${value.case_id}`);
@@ -202,6 +220,8 @@ function App() {
             study={study}
             side={side}
             branch={branch}
+            segmentations={segmentations}
+            onSeriesChange={updateSegmentation}
             onSide={setSide}
             onBranch={setBranch}
             onStep={setStep}
@@ -260,6 +280,7 @@ function App() {
                   side={side}
                   branch={branch}
                   study={study}
+                  onSeriesChange={updateSegmentation}
                   onError={setError}
                 />
               )}

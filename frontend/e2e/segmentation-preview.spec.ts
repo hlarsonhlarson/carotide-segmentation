@@ -41,6 +41,10 @@ test("segmentation: native wall preview, current ring and live contour edits", a
   await page
     .getByRole("button", { name: "Открыть проект", exact: true })
     .click();
+  const mainPreview = page.locator(".preview-pane");
+  await mainPreview
+    .locator("canvas")
+    .evaluate((el) => el.setAttribute("data-persistent", "yes"));
   await page.getByRole("button", { name: "Контуры вдоль пути…" }).click();
   const dialog = page.locator("dialog"),
     preview = dialog.locator(".wall-preview");
@@ -67,6 +71,13 @@ test("segmentation: native wall preview, current ring and live contour edits", a
   await expect(preview).toContainText("кольцо радиуса");
   await dialog.getByRole("button", { name: "Применить к сечению" }).click();
   await expect(preview).toContainText("2 контуров · 1 участков стенки");
+  await expect(mainPreview.locator(".path-wall-status")).toContainText(
+    "ICA: 1 участков стенки",
+  );
+  await expect(mainPreview.locator("canvas")).toHaveAttribute(
+    "data-persistent",
+    "yes",
+  );
   await expect(preview.locator("canvas")).toHaveAttribute(
     "data-original",
     "yes",
@@ -87,6 +98,9 @@ test("segmentation: native wall preview, current ring and live contour edits", a
   await dialog.getByRole("button", { name: "Удалить контур" }).click();
   await expect(preview).toContainText("1 контуров · 0 участков стенки");
   await expect(preview).toContainText("кольцо радиуса");
+  await expect(mainPreview.locator(".path-wall-status")).toContainText(
+    "ICA: 0 участков стенки",
+  );
   await dialog.getByRole("button", { name: "Обработать все сечения" }).click();
   await expect(
     dialog.getByRole("button", { name: "Обработать все сечения" }),
@@ -105,8 +119,35 @@ test("segmentation: native wall preview, current ring and live contour edits", a
     path: "../data/runtime/segmentation-wall-preview.png",
     fullPage: true,
   });
-  // Reopening uses saved contours and reconstructs the same preview.
+  // The mask remains over the path after closing Segmentation.
   await dialog.getByRole("button", { name: "Закрыть окно" }).click();
+  await expect(mainPreview.locator(".path-wall-status")).toContainText(
+    `ICA: ${total - 1} участков стенки`,
+  );
+  await page.getByRole("button", { name: "Левая", exact: true }).click();
+  await expect(mainPreview.locator(".path-wall-status")).toContainText(
+    "ICA: 0 участков стенки",
+  );
+  await page.getByRole("button", { name: "Правая", exact: true }).click();
+  await expect(mainPreview.locator(".path-wall-status")).toContainText(
+    `ICA: ${total - 1} участков стенки`,
+  );
+  // Reopening the saved project reloads its contours for the main viewport.
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Открыть сохранённый проект…" })
+    .click();
+  await page.getByLabel("Папка проекта").fill(project);
+  await page
+    .getByRole("button", { name: "Открыть проект", exact: true })
+    .click();
+  await expect(mainPreview.locator(".path-wall-status")).toContainText(
+    `ICA: ${total - 1} участков стенки`,
+  );
+  await page.screenshot({
+    path: "../data/runtime/path-with-segmentation.png",
+    fullPage: true,
+  });
   await page.getByRole("button", { name: "Контуры вдоль пути…" }).click();
   await expect(preview).toContainText(
     `${total} контуров · ${total - 1} участков стенки`,
@@ -120,5 +161,14 @@ test("segmentation: native wall preview, current ring and live contour edits", a
   expect(await dialog.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(
     true,
   );
+  await dialog.getByRole("button", { name: "Закрыть окно" }).click();
+  // Editing the centerline invalidates the segmentation rather than leaving a stale mask.
+  await page
+    .getByRole("button", { name: "Очистить ветвь", exact: true })
+    .click();
+  await expect(mainPreview.locator(".path-wall-status")).toContainText(
+    "ICA: 0 участков стенки",
+  );
+  await expect(page.locator(".point-card")).toHaveCount(0);
   expect(errors).toEqual([]);
 });

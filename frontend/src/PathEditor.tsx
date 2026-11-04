@@ -1,5 +1,10 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { request } from "./Segmentation";
+import {
+  segmentationKey,
+  type SegmentationPoint,
+  type SegmentationChange,
+} from "./segmentationGeometry";
 import { useImageNavigation } from "./useImageNavigation";
 import { PathPreview, branches, branchColors } from "./PathPreview";
 export type Axis = "axial" | "coronal" | "sagittal";
@@ -216,6 +221,8 @@ export function PathEditor({
   onBranch,
   onStep,
   workflow,
+  segmentations,
+  onSeriesChange,
 }: {
   base: string;
   side: string;
@@ -226,6 +233,8 @@ export function PathEditor({
   onBranch: (s: string) => void;
   onStep: (n: number) => void;
   workflow: ReactNode;
+  segmentations: Record<string, SegmentationPoint[]>;
+  onSeriesChange: SegmentationChange;
 }) {
   const [indices, setIndices] = useState<number[]>(
     study.shape.map((n: number) => Math.floor(n / 2)),
@@ -243,17 +252,37 @@ export function PathEditor({
   const [ww, setWw] = useState<number>(study.default_window.ww);
   const lock = useRef(false);
   const route = `${base}/centerline/${side}/${branch}`;
-  useEffect(() => {
-    let active = true;
-    Promise.all([
+  const generation = useRef(0);
+  const wallSeries = useMemo(
+    () =>
+      Object.fromEntries(
+        branches.map((b) => [
+          b,
+          segmentations[segmentationKey(base, side, b)] || [],
+        ]),
+      ),
+    [segmentations, base, side],
+  );
+  async function readState() {
+    return Promise.all([
       request(base + "/control_points"),
       request(base + "/centerline"),
-    ])
-      .then(([p, path]) => {
-        if (active) {
-          setPoints(p);
-          setPaths(path);
-        }
+      ...branches.map((b) => request(`${base}/segment/${side}/${b}`)),
+    ]);
+  }
+  function acceptState([p, path, ...series]: any[]) {
+    setPoints(p);
+    setPaths(path);
+    branches.forEach((b, i) =>
+      onSeriesChange(base, side, b, series[i].points || []),
+    );
+  }
+  useEffect(() => {
+    let active = true;
+    const current = ++generation.current;
+    readState()
+      .then((data) => {
+        if (active && current === generation.current) acceptState(data);
       })
       .catch((e) => {
         if (active) onError(String(e));
@@ -265,16 +294,15 @@ export function PathEditor({
   async function action(fn: () => Promise<unknown>) {
     if (lock.current) return;
     lock.current = true;
+    ++generation.current;
     setBusy(true);
     onError("");
     try {
       await fn();
-      const [p, path] = await Promise.all([
-        request(base + "/control_points"),
-        request(base + "/centerline"),
-      ]);
-      setPoints(p);
-      setPaths(path);
+      // A path mutation invalidates its contours on the server. Clear stale
+      // overlays immediately, then restore the current per-branch state.
+      branches.forEach((b) => onSeriesChange(base, side, b, []));
+      acceptState(await readState());
     } catch (e) {
       onError(String(e));
     } finally {
@@ -345,6 +373,8 @@ export function PathEditor({
             paths={paths}
             spacing={study.spacing_mm}
             displayFlips={study.display_flips}
+            origin={study.origin_mm}
+            segmentations={wallSeries}
             side={side}
           />
         </div>

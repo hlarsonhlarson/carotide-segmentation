@@ -146,3 +146,12 @@ export function selectedRing(
     );
   }).filter((p) => Number.isFinite(p.distanceTo(center)));
 }
+
+export const segmentationKey = (base: string, side: string, branch: string) =>
+  `${base}/${side}/${branch}`;
+export type SegmentationChange = (
+  base: string,
+  side: string,
+  branch: string,
+  points: SegmentationPoint[],
+) => void;

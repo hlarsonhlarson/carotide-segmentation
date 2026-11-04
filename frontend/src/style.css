@@ -887,3 +887,26 @@ dialog.segmentation-dialog {
     white-space: normal;
   }
 }
+.preview-pane > .pane-title > button {
+  padding: 2px 6px;
+  font-size: 11px;
+}
+.path-wall-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 9px 0;
+  color: var(--dim);
+  font-size: 9px;
+}
+.path-wall-status span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.path-wall-status i {
+  flex-shrink: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
