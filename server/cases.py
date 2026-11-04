@@ -14,6 +14,9 @@ class CaseState:
     origin_mm: np.ndarray   # (z, y, x)
     modality: str
     source_path: str
+    # Intensity statistics of the immutable image, computed once per load.
+    array_min: float = field(init=False)
+    default_window: tuple[float, float] = field(init=False)
     # Which DICOM series (of possibly several in source_path) this case
     # is — None when the folder only had one and no choice was made.
     # Saved into the project manifest (see app.py's /projects/open) so
@@ -36,6 +39,8 @@ class CaseState:
     # {side: stl_bytes} — the last built surface per side, kept in memory
     # so GET can serve it without re-building or touching the filesystem.
     built_surfaces: dict = field(default_factory=dict)
+    surface_cache: dict = field(default_factory=dict)
+    surface_cache_lock: object = field(default_factory=threading.Lock, repr=False)
     # {side: {"state": "running"|"done"|"error", "vtu": bytes, "vtp": bytes,
     #         "face_map": dict, "diag": dict, "error": str}} — the SU2-
     # ready volume+surface mesh job, run in a background thread since a
@@ -88,6 +93,16 @@ class CaseState:
     stale: dict = field(default_factory=lambda: {side: set() for side in ("left", "right")})
     saved_artifacts: dict = field(default_factory=dict)
     project_warnings: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.array_min = float(self.array.min())
+        if self.modality == "CT":
+            self.default_window = (300.0, 800.0)
+        else:
+            lo, hi = np.percentile(self.array, [1.0, 99.0])
+            if hi <= lo:
+                hi = lo + 1.0
+            self.default_window = (float((lo + hi) / 2.0), float(hi - lo))
 
 
 _CASES: dict[str, CaseState] = {}

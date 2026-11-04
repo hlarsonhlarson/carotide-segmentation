@@ -137,6 +137,8 @@ docker compose run --rm backend python -m server.migrate_project /data/projects/
 
 Ограничения: произвольная ориентация DICOM ещё не поддерживается внутренней моделью координат; клиническая точность сегментации и физическая достоверность CFD не подтверждаются инженерными тестами. План проверки — [docs/validation.md](docs/validation.md).
 
+Кэширование снимков и поверхностей, ускорение macOS-просмотрщика и замеры — [PERFORMANCE.md](PERFORMANCE.md).
+
 ### Сквозной браузерный тест
 
 Синтетические данные можно создать в новой папке командой `python tests/create_demo.py data/dicom/synthetic-demo` (нужны NumPy и pydicom). Затем при работающем Docker-приложении:

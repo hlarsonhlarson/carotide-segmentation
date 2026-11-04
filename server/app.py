@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import (
     build_surface, cases, centerline_path, dicom_io, path_series, reslice, segment2d,
-    su2_export, su2_postprocess, su2_run,
+    su2_export, su2_postprocess, su2_run, surface_cache,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -122,20 +122,6 @@ def _window_png(array2d: np.ndarray, wl: float, ww: float) -> bytes:
     return buf.getvalue()
 
 
-def _default_window(array: np.ndarray, modality: str):
-    """(center, width) in intensity units. CT: fixed, vessel-friendly (wide
-    enough to show contrast-enhanced lumen without blowing out bone). MR has
-    no fixed intensity scale, so stretch from this volume's own 1st/99th
-    percentile instead — same percentile-based approach already used for
-    TOF display elsewhere in this project (mra_pipeline's MIP diagnostics)."""
-    if modality == "CT":
-        return 300.0, 800.0
-    lo, hi = np.percentile(array, [1.0, 99.0])
-    if hi <= lo:
-        hi = lo + 1.0
-    return float((lo + hi) / 2.0), float(hi - lo)
-
-
 @app.get("/series")
 def get_series(path: str):
     path = str(storage.allowed_path(path, "dicom"))
@@ -173,7 +159,7 @@ def _load_dicom_case(path: str, series_uid: str | None):
         raise HTTPException(status_code=400, detail=f"could not load DICOM series: {e}")
 
     case = cases.create(array, spacing_mm, origin_mm, modality, str(Path(path).expanduser().resolve()), series_uid=series_uid)
-    wl, ww = _default_window(array, modality)
+    wl, ww = case.default_window
     info = {
         "case_id": case.case_id,
         "shape": list(array.shape),
@@ -197,7 +183,7 @@ def get_meta(case_id: str):
     case = cases.get(case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="unknown case_id")
-    wl, ww = _default_window(case.array, case.modality)
+    wl, ww = case.default_window
     return {
         "case_id": case.case_id,
         "shape": list(case.array.shape),
@@ -238,7 +224,7 @@ def get_slice(case_id: str, axis: str, index: int, wl: float | None = None, ww: 
         plane = case.array[::-1, :, index]
 
     if wl is None or ww is None:
-        wl, ww = _default_window(case.array, case.modality)
+        wl, ww = case.default_window
     return Response(content=_window_png(plane, wl, ww), media_type="image/png")
 
 
@@ -525,9 +511,10 @@ def get_segment_slice(case_id: str, side: str, branch: str, index: int,
     slice_2d, u_vec, v_vec, grid_origin = reslice.sample_oblique_slice(
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
     )
     if wl is None or ww is None:
-        wl, ww = _default_window(case.array, case.modality)
+        wl, ww = case.default_window
     png = _window_png(slice_2d, wl, ww)
     headers = {
         "X-Grid-Origin-Mm": ",".join(str(v) for v in grid_origin),
@@ -548,6 +535,7 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
     slice_2d, u_vec, v_vec, grid_origin = reslice.sample_oblique_slice(
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
     )
     center_px = (RESLICE_SIZE_PX / 2.0, RESLICE_SIZE_PX / 2.0)
     max_radius_px = MAX_CONTOUR_RADIUS_MM / RESLICE_PX_SPACING_MM
@@ -630,6 +618,7 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
     _, u_vec, v_vec, grid_origin = reslice.sample_oblique_slice(
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
     )
     contour_px_list = [[float(r), float(c)] for r, c in req.contour_px]
     contour_mm = [
@@ -723,15 +712,15 @@ def build_surface_endpoint(case_id: str, side: str):
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
 
-    series_by_branch = {
+    series_by_branch = copy.deepcopy({
         branch: case.segmentation_series.get((side, branch), [])
         for branch in BRANCHES
-    }
+    })
     if not series_by_branch.get("cca_ica"):
         raise HTTPException(status_code=400, detail="CCA→ICA path must be segmented before building a surface")
 
     try:
-        poly, diag = build_surface.build_surface(case.array.shape, case.spacing_mm, case.origin_mm, series_by_branch)
+        poly, diag = surface_cache.get_surface(case, side, series_by_branch)
     except Exception as e:
         log.exception("build_surface failed for %s/%s", case_id, side)
         raise HTTPException(status_code=400, detail=f"surface build failed: {e}")
@@ -780,15 +769,15 @@ def start_su2_mesh(case_id: str, side: str):
     if existing and existing.get("state") == "running":
         raise HTTPException(status_code=409, detail="a mesh job is already running for this side")
 
-    series_by_branch = {
+    series_by_branch = copy.deepcopy({
         branch: case.segmentation_series.get((side, branch), [])
         for branch in BRANCHES
-    }
+    })
     if not series_by_branch.get("cca_ica"):
         raise HTTPException(status_code=400, detail="CCA→ICA path must be segmented before building a mesh")
 
     try:
-        poly, diag = build_surface.build_surface(case.array.shape, case.spacing_mm, case.origin_mm, series_by_branch)
+        poly, diag = surface_cache.get_surface(case, side, series_by_branch)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"surface build failed: {e}")
     if poly is None:
@@ -797,7 +786,6 @@ def start_su2_mesh(case_id: str, side: str):
     workflow.invalidate(case, side, 'mesh')
     job = {"state": "running", "stage": "tagging_faces", "stage_info": {}}
     case.su2_mesh_jobs[side] = job
-    series_by_branch = copy.deepcopy(series_by_branch)
     # A rebuilt mesh invalidates any previous run/results for this side —
     # without this, an old finished (or restored-from-disk) su2_run/
     # su2_postprocess stays reachable via its own status/result endpoints

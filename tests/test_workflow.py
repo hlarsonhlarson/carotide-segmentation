@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from vtk import vtkPolyData
 
 from server import app as backend, cases, projects, workflow, su2_run
 from server.coordinates import voxel_to_world, world_to_voxel, surface_xyz
@@ -124,7 +125,7 @@ def test_old_mesh_completion_cannot_resurrect_results(client, case, monkeypatch)
         threads.append(thread)
         return thread
     monkeypatch.setattr(backend.threading, 'Thread', track)
-    monkeypatch.setattr(backend.build_surface, 'build_surface', lambda *a: (object(), {}))
+    monkeypatch.setattr(backend.build_surface, 'build_surface', lambda *a: (vtkPolyData(), {}))
     def slow_mesh(*args, **kwargs):
         started.set()
         assert finish.wait(3)
