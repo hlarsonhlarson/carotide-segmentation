@@ -234,6 +234,7 @@ function App() {
             }
           />
           <dialog
+            className={step === 1 ? "segmentation-dialog" : undefined}
             ref={dialog}
             onCancel={() => setStep(0)}
             onClose={() => setStep(0)}
@@ -258,6 +259,7 @@ function App() {
                   base={base}
                   side={side}
                   branch={branch}
+                  study={study}
                   onError={setError}
                 />
               )}

@@ -717,3 +717,173 @@ dialog::backdrop {
   max-width: 100%;
   min-width: 0;
 }
+/* Native-style segmentation: editor left, growing wall preview right. */
+dialog.segmentation-dialog {
+  width: min(1320px, calc(100vw - 32px));
+}
+.segmentation-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+.segmentation-editor {
+  min-width: 0;
+}
+.segmentation-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.segmentation-title h2 {
+  margin: 0;
+  font-size: 15px;
+}
+.segmentation-title button {
+  font-size: 11px;
+}
+.section-position {
+  display: flex;
+  justify-content: space-between;
+  color: var(--dim);
+  margin-bottom: 8px;
+  font-size: 11px;
+}
+.segmentation-slice {
+  position: relative;
+  height: clamp(300px, 43vh, 520px);
+  background: #080a0e;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmentation-slice svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+}
+.section-navigation {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin: 10px 0;
+}
+.section-navigation input {
+  flex: 1;
+  min-width: 30px;
+}
+.segment-contrast {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  margin-top: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--raised);
+}
+.segment-contrast label {
+  font-size: 10px;
+}
+.segment-contrast button {
+  font-size: 10px;
+}
+.segment-parameters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.segmentation-editor .button-row {
+  margin-top: 8px;
+}
+.segmentation-editor progress {
+  width: 100%;
+  accent-color: var(--bright);
+  margin-top: 12px;
+  height: 12px;
+}
+.segmentation-editor p {
+  font-size: 11px;
+}
+.wall-preview {
+  position: sticky;
+  top: 56px;
+  min-width: 0;
+  background: #080a0e;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.wall-preview .pane-title span {
+  font:
+    700 11px -apple-system,
+    sans-serif;
+  color: var(--bright);
+}
+.wall-preview .pane-title button {
+  padding: 3px 8px;
+}
+.wall-preview-canvas {
+  height: clamp(440px, 65vh, 780px);
+  position: relative;
+}
+.wall-preview-canvas canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+}
+.wall-preview-caption {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--dim);
+  background: var(--panel);
+}
+.wall-preview > small {
+  display: block;
+  background: var(--panel);
+  padding: 0 10px 10px;
+  line-height: 1.5;
+}
+.wall-preview-hint {
+  position: absolute;
+  top: 40%;
+  left: 15px;
+  right: 15px;
+  text-align: center;
+  pointer-events: none;
+}
+.segmentation-empty {
+  min-height: 300px;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  padding: 30px;
+  background: var(--panel);
+  border-radius: 6px;
+}
+@media (max-width: 800px) {
+  .segmentation-workspace {
+    grid-template-columns: 1fr;
+  }
+  .wall-preview {
+    position: relative;
+    top: 0;
+  }
+  .wall-preview-canvas {
+    height: 420px;
+  }
+  .segment-contrast {
+    grid-template-columns: 1fr 1fr;
+  }
+  .segmentation-title button {
+    white-space: normal;
+  }
+  .segmentation-editor .button-row button {
+    white-space: normal;
+  }
+}
