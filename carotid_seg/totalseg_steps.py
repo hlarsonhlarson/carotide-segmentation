@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import shutil
 
 from totalsegmentator.python_api import totalsegmentator
@@ -18,10 +19,16 @@ def run_bootstrap_segmentations(ct_path: Path, work_dir: Path, device: str = "gp
     work_dir.mkdir(parents=True, exist_ok=True)
 
     total_out = work_dir / "total"
+    # This stage only supplies an editable CCA seed and vertebral landmarks.
+    # The normal ``total`` task runs five 1.5-mm models; its native fast mode
+    # uses one 3-mm model and is substantially quicker for a draft proposal.
+    # ICA still comes from the dedicated high-resolution head/neck model below.
+    cpu_count = os.cpu_count() or 1
     totalsegmentator(
         str(ct_path), str(total_out),
         task="total", roi_subset=CCA_CLASSES + NECK_VERTEBRAE,
-        device=device, fast=False, quiet=True,
+        device=device, fast=True, quiet=True,
+        nr_thr_resamp=min(8, cpu_count), nr_thr_saving=min(8, cpu_count),
     )
 
     # roi_subset is only supported for task="total"/"total_mr" — headneck_bones_vessels

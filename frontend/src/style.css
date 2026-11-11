@@ -77,6 +77,62 @@ small,
 .muted {
   color: var(--dim);
 }
+.warning {
+  margin: 8px 16px;
+  padding: 8px 10px;
+  color: #fff1bd;
+  background: #5f4d24;
+  border-left: 3px solid #f0c75e;
+  border-radius: 3px;
+}
+.review-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+}
+.review-list button {
+  padding: 4px 7px;
+  color: #fff1bd;
+  background: #765d25;
+  font-size: 11px;
+}
+.review-accept {
+  margin-top: 8px;
+  color: #25311d;
+  background: #d9e89c;
+}
+.review-confirmed {
+  margin: 7px 0 0;
+  color: #fff1bd;
+}
+.folder-picker {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+  padding: 10px;
+  background: var(--panel);
+  border-radius: 5px;
+}
+.folder-picker-path {
+  overflow-wrap: anywhere;
+  color: var(--dim);
+}
+.folder-picker-actions,
+.folder-picker-folders {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.folder-picker-folders button {
+  text-align: left;
+}
+.autoseed-status {
+  margin: 6px 0 0;
+  color: var(--dim);
+  font-size: 0.9rem;
+}
 p {
   line-height: 1.5;
 }

@@ -32,6 +32,7 @@ export function Segmentation({
   side,
   branch,
   study,
+  focusIndex = null,
   onSeriesChange,
   onError,
 }: {
@@ -39,6 +40,7 @@ export function Segmentation({
   side: string;
   branch: string;
   study: any;
+  focusIndex?: number | null;
   onSeriesChange: SegmentationChange;
   onError: (message: string) => void;
 }) {
@@ -87,6 +89,11 @@ export function Segmentation({
       active = false;
     };
   }, [route]);
+  useEffect(() => {
+    if (focusIndex === null || !points.length) return;
+    setIndex(Math.max(0, Math.min(focusIndex, points.length - 1)));
+    setManual([]);
+  }, [focusIndex, points.length]);
   async function action(fn: () => Promise<unknown>) {
     if (lock.current) return;
     lock.current = true;

@@ -23,11 +23,19 @@ function App() {
   const [branch, setBranch] = useState("cca_ica");
   const [project, setProject] = useState("/data/projects/study");
   const [message, setMessage] = useState("");
-  const [loader, setLoader] = useState<"dicom" | "projects" | null>(null);
+  const [loader, setLoader] = useState<"dicom" | "projects" | null>("dicom");
   const [step, setStep] = useState(0);
   const [segmentations, setSegmentations] = useState<
     Record<string, SegmentationPoint[]>
   >({});
+  const [autoseed, setAutoseed] = useState<any>(null);
+  const [pathRevision, setPathRevision] = useState(0);
+  const [reviewTarget, setReviewTarget] = useState<{
+    side: string;
+    branch: string;
+    index: number;
+  } | null>(null);
+  const appliedAutoseed = useRef<string | null>(null);
   const updateSegmentation = useCallback<SegmentationChange>(
     (base, side, branch, points) => {
       const key = segmentationKey(base, side, branch);
@@ -53,14 +61,96 @@ function App() {
       setBusy(false);
     }
   }
+  const findSeries = useCallback(
+    async (folder = path) => {
+      const data = await request("/series?path=" + encodeURIComponent(folder));
+      setSeries(data.series);
+      setMessage(
+        data.series.length
+          ? `Найдено серий: ${data.series.length}. Выберите нужную ниже.`
+          : "В выбранной папке DICOM-серий не найдено.",
+      );
+    },
+    [path],
+  );
   function opened(value: any) {
     setSegmentations({});
+    setAutoseed(null);
+    setPathRevision(0);
+    setReviewTarget(null);
+    appliedAutoseed.current = null;
     setStudy(value);
     setStep(0);
     setProject(value.project_dir || `/data/projects/study-${value.case_id}`);
     setMessage(value.warnings?.join("\n") || "Исследование открыто");
   }
   const base = study ? "/cases/" + study.case_id : "";
+  useEffect(() => {
+    if (!study) return;
+    let active = true;
+    async function poll() {
+      try {
+        const next = await request(base + "/autoseed");
+        if (!active) return;
+        setAutoseed(next);
+        if (next.state === "done" && appliedAutoseed.current !== next.id) {
+          appliedAutoseed.current = next.id;
+          setPathRevision((value) => value + 1);
+          setMessage(next.message || "Автоматический черновик путей готов. Проверьте его перед продолжением.");
+        }
+      } catch {
+        // Automatic seeding is optional; do not hide the regular editor if a
+        // backend without this capability is opened during an upgrade.
+      }
+    }
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [base, study]);
+  function startAutoseed() {
+    run(async () => {
+      const job = await request(base + "/autoseed", {});
+      setAutoseed(job);
+      setMessage("Запущена автоматическая сегментация. Это может занять несколько минут.");
+    });
+  }
+  const reviewIssues = Object.entries(autoseed?.contour_qa || {}).flatMap(
+    ([key, report]: [string, any]) => {
+      const [issueSide, issueBranch] = key.split(":");
+      return (report.rejected_sections || []).map((issue: any) => ({
+        side: issueSide,
+        branch: issueBranch,
+        index: issue.index,
+        reason: issue.reason,
+      }));
+    },
+  );
+  const autoseedStatus =
+    autoseed?.stage === "preparing"
+      ? "подготовка объёма"
+      : autoseed?.stage === "segmenting"
+        ? "модель обрабатывает КТ на CPU — это может занять несколько минут"
+        : autoseed?.stage === "extracting_paths"
+          ? "извлечение путей сосудов"
+          : autoseed?.stage === "segmenting_contours"
+            ? "создание черновых контуров"
+            : "ожидание";
+  function reviewIssue(issue: { side: string; branch: string; index: number }) {
+    setSide(issue.side);
+    setBranch(issue.branch);
+    setReviewTarget(issue);
+    setStep(1);
+  }
+  function acceptAutoseedReview() {
+    run(async () => {
+      const job = await request(base + "/autoseed/accept", {});
+      setAutoseed(job);
+      setMessage("Проверка автоматического черновика подтверждена. Результат всё ещё имеет статус unvalidated.");
+    });
+  }
   async function save() {
     await request(base + "/project", { path: project });
     await request(base + "/save/project", {});
@@ -93,12 +183,10 @@ function App() {
       {!study ? (
         <div className="case-loader">
           <h1>Carotid Segmentation</h1>
-          <p>
-            Откройте папку DICOM или продолжите работу с сохранённым проектом.
-          </p>
+          <p>Выберите папку с КТ-снимками на компьютере, затем выберите серию.</p>
           <div className="button-row centered">
-            <button className="primary" onClick={() => setLoader("dicom")}>
-              Выбрать папку DICOM…
+            <button onClick={() => setLoader("dicom")}>
+              Показать папки DICOM
             </button>
             <button onClick={() => setLoader("projects")}>
               Открыть сохранённый проект…
@@ -109,7 +197,15 @@ function App() {
               <FolderPicker
                 key={loader}
                 kind={loader}
-                onSelect={loader === "dicom" ? setPath : setProject}
+                onSelect={
+                  loader === "dicom"
+                    ? (folder) =>
+                        run(async () => {
+                          setPath(folder);
+                          await findSeries(folder);
+                        })
+                    : setProject
+                }
               />
               {loader === "dicom" ? (
                 <>
@@ -123,18 +219,7 @@ function App() {
                   <button
                     disabled={busy}
                     className="primary"
-                    onClick={() =>
-                      run(async () => {
-                        const data = await request(
-                          "/series?path=" + encodeURIComponent(path),
-                        );
-                        setSeries(data.series);
-                        if (!data.series.length)
-                          setMessage(
-                            "В выбранной папке DICOM-серий не найдено.",
-                          );
-                      })
-                    }
+                    onClick={() => run(() => findSeries())}
                   >
                     Найти DICOM-серии
                   </button>
@@ -208,14 +293,51 @@ function App() {
             <span className="study-status" role="status">
               {message}
             </span>
+            <button
+              disabled={busy || autoseed?.state === "queued" || autoseed?.state === "running"}
+              onClick={startAutoseed}
+              title="Первый запуск модели на CPU для большого КТ-объёма может занять десятки минут; расчёт продолжается, пока отображается этот статус."
+            >
+              {autoseed?.state === "queued" || autoseed?.state === "running"
+                ? `Автосегментация: ${autoseed.progress || 0}%`
+                : "Автосегментация"}
+            </button>
           </div>
+          {(autoseed?.state === "queued" || autoseed?.state === "running") && (
+            <p className="autoseed-status" role="status">
+              {autoseedStatus}. Индикатор обновится после завершения этапа модели.
+            </p>
+          )}
+          {autoseed?.review_required && autoseed.state === "done" && (
+            <section className="warning" role="status">
+              <strong>Автоматический результат — черновик.</strong> Проверьте пути и контуры до построения поверхности или CFD.
+              {reviewIssues.length > 0 && (
+                <div className="review-list">
+                  <span>Требуют исправления: {reviewIssues.length}</span>
+                  {reviewIssues.slice(0, 20).map((issue, order) => (
+                    <button key={`${issue.side}:${issue.branch}:${issue.index}:${order}`} onClick={() => reviewIssue(issue)}>
+                      {issue.side === "right" ? "Правая" : "Левая"} · {issue.branch === "cca_ica" ? "CCA→ICA" : "CCA→ECA"} · сечение {issue.index + 1}
+                    </button>
+                  ))}
+                  {reviewIssues.length > 20 && <small>Показаны первые 20 проблемных сечений.</small>}
+                </div>
+              )}
+              {!autoseed.review_accepted ? (
+                <button className="review-accept" disabled={busy} onClick={acceptAutoseedReview}>
+                  Подтвердить проверку черновика
+                </button>
+              ) : (
+                <p className="review-confirmed">Проверка оператором подтверждена. Статус клинической валидации не присвоен.</p>
+              )}
+            </section>
+          )}
           {error && (
             <div className="error" role="alert">
               {error}
             </div>
           )}
           <PathEditor
-            key={base + side}
+            key={base + side + pathRevision}
             base={base}
             study={study}
             side={side}
@@ -280,6 +402,7 @@ function App() {
                   side={side}
                   branch={branch}
                   study={study}
+                  focusIndex={reviewTarget?.side === side && reviewTarget?.branch === branch ? reviewTarget.index : null}
                   onSeriesChange={updateSegmentation}
                   onError={setError}
                 />

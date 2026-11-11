@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import (
     build_surface, cases, centerline_path, dicom_io, path_series, reslice, segment2d,
-    su2_export, su2_postprocess, su2_run, surface_cache,
+    su2_export, su2_postprocess, su2_run, surface_cache, autoseed as autoseed_job,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -237,9 +237,72 @@ def get_slice(case_id: str, axis: str, index: int, wl: float | None = None, ww: 
 
 
 @app.post("/cases/{case_id}/autoseed")
-@workflow.edit
 def autoseed(case_id: str):
-    raise HTTPException(status_code=501, detail="not implemented yet")
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    if case.modality != "CT":
+        raise HTTPException(status_code=422, detail="automatic seeding currently requires contrast-enhanced CT")
+    with case.lock:
+        job = autoseed_job.start(case)
+    return _public_autoseed_job(job)
+
+
+def _public_autoseed_job(job):
+    if not job:
+        return {"state": "idle"}
+    # Tracebacks are useful in server logs but must not be exposed by the API.
+    return {key: value for key, value in job.items() if key not in {"traceback", "revision"}}
+
+
+@app.get("/cases/{case_id}/autoseed")
+@workflow.locked
+def autoseed_status(case_id: str):
+    return _public_autoseed_job(cases.get(case_id).autoseed_job)
+
+
+@app.post("/cases/{case_id}/autoseed/accept")
+@workflow.edit
+def accept_autoseed_review(case_id: str):
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    job = case.autoseed_job
+    if not job or job.get("state") != "done":
+        raise HTTPException(status_code=409, detail="there is no completed automatic draft to review")
+    missing = []
+    for key in job.get("paths", {}):
+        side, branch = key.split(":", 1)
+        series = case.segmentation_series.get((side, branch), [])
+        missing.extend(f"{side}:{branch}:{index + 1}" for index, point in enumerate(series)
+                       if not point.get("contour_mm"))
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Automatic draft still has unsegmented sections. Repair every listed section before confirming review.",
+                "missing_sections": missing,
+            },
+        )
+    case.autoseed_review = {"job_id": job["id"], "accepted": True}
+    job["review_accepted"] = True
+    return _public_autoseed_job(job)
+
+
+def _require_autoseed_review(case):
+    """Block downstream geometry only for a completed automatic draft.
+
+    Purely manual cases retain the pre-existing workflow; this is a safety
+    gate against treating an unattended ML/rule-based result as validated.
+    """
+    job = case.autoseed_job
+    if job and job.get("state") == "done":
+        review = case.autoseed_review
+        if review.get("job_id") != job.get("id") or not review.get("accepted"):
+            raise HTTPException(
+                status_code=409,
+                detail="Review the automatic contours and confirm the draft before building a surface, mesh, or CFD result.",
+            )
 
 
 def _check_side_branch(side: str, branch: str):
@@ -719,6 +782,7 @@ def build_surface_endpoint(case_id: str, side: str):
         raise HTTPException(status_code=404, detail="unknown case_id")
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    _require_autoseed_review(case)
 
     series_by_branch = copy.deepcopy({
         branch: case.segmentation_series.get((side, branch), [])
@@ -772,6 +836,7 @@ def start_su2_mesh(case_id: str, side: str):
         raise HTTPException(status_code=404, detail="unknown case_id")
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    _require_autoseed_review(case)
 
     existing = case.su2_mesh_jobs.get(side)
     if existing and existing.get("state") == "running":
@@ -943,6 +1008,7 @@ def start_su2_run(case_id: str, side: str):
         raise HTTPException(status_code=404, detail="unknown case_id")
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    _require_autoseed_review(case)
 
     existing = case.su2_run_jobs.get(side)
     if existing and existing.get("state") in ("running", "cancelling"):

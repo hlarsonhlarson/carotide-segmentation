@@ -46,6 +46,7 @@ def snapshot(case):
             'params': case.su2_params.get(side),
         } for side in workflow.SIDES},
         'artifacts': case.saved_artifacts, 'warnings': case.project_warnings,
+        'autoseed_review': case.autoseed_review,
     }
 
 
@@ -196,6 +197,7 @@ def restore(case, manifest, folder):
             or geometry.get('coordinate_system') != 'zyx-mm'):
         raise HTTPException(409, 'Source image geometry has changed; original project was not modified.')
     case.project_warnings = list(manifest.get('warnings', []))
+    case.autoseed_review = dict(manifest.get('autoseed_review', {}))
     case.project_id = manifest['project_id']
     case.revisions = manifest['revisions']
     case.stale = {s: set(manifest.get('stale', {}).get(s, [])) for s in workflow.SIDES}

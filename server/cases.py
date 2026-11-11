@@ -37,6 +37,13 @@ class CaseState:
     # resampled control point per entry, segmentation added as the user
     # works through it.
     segmentation_series: dict = field(default_factory=dict)
+    # One automatic segmentation job for the loaded study.  It is intentionally
+    # transient: source data, edits and accepted results live in project.json;
+    # an interrupted model run must be restarted explicitly after a reload.
+    autoseed_job: dict | None = None
+    # Explicit operator acknowledgement for the current automatic draft.  A
+    # completed model job alone is never sufficient to export geometry/CFD.
+    autoseed_review: dict = field(default_factory=dict)
     # {side: stl_bytes} — the last built surface per side, kept in memory
     # so GET can serve it without re-building or touching the filesystem.
     built_surfaces: dict = field(default_factory=dict)

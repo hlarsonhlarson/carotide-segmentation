@@ -27,27 +27,38 @@ export function FolderPicker({
     };
   }, [path, kind]);
   return (
-    <details>
-      <summary>Выбрать папку</summary>
+    <section className="folder-picker" aria-label="Выбор папки">
+      <strong>{kind === "dicom" ? "Папка со снимками" : "Папка проектов"}</strong>
       {error && <p role="alert">{error}</p>}
       {data && (
         <>
-          <p>{data.path === "." ? "Корневая папка" : data.path}</p>
-          <button
-            onClick={() => setPath(path.split("/").slice(0, -1).join("/"))}
-          >
-            На уровень выше
-          </button>
-          {data.folders.map((f: any) => (
-            <button key={f.path} onClick={() => setPath(f.path)}>
-              📁 {f.name}
+          <div className="folder-picker-path">
+            {data.path === "." ? "Корневая папка" : data.path}
+          </div>
+          <div className="folder-picker-actions">
+            <button
+              disabled={!path}
+              onClick={() => setPath(path.split("/").slice(0, -1).join("/"))}
+            >
+              ← Выше
             </button>
-          ))}
-          <button onClick={() => onSelect(data.absolute_path)}>
-            Выбрать эту папку
-          </button>
+            <button className="primary" onClick={() => onSelect(data.absolute_path)}>
+              Использовать эту папку
+            </button>
+          </div>
+          {data.folders.length ? (
+            <div className="folder-picker-folders">
+              {data.folders.map((f: any) => (
+                <button key={f.path} onClick={() => setPath(f.path)}>
+                  📁 {f.name}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p>В этой папке нет вложенных каталогов.</p>
+          )}
         </>
       )}
-    </details>
+    </section>
   );
 }
