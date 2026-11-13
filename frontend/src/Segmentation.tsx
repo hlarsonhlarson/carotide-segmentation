@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useImageNavigation } from "./useImageNavigation";
 import { SegmentationPreview } from "./SegmentationPreview";
 import { branchColors } from "./PathPreview";
+import { LumenMeasurements } from "./LumenMeasurements";
 import type {
   SegmentationPoint,
   SegmentationChange,
@@ -48,7 +49,10 @@ export function Segmentation({
   const [points, setPoints] = useState<SegmentationPoint[]>([]);
   const [index, setIndex] = useState(0);
   const [method, setMethod] = useState("auto");
+  const isManual = method === "manual" || method === "wall_manual";
   const [radius, setRadius] = useState(3);
+  const [calciumHu, setCalciumHu] = useState(600);
+  const [wallSearch, setWallSearch] = useState(6);
   const [manual, setManual] = useState<number[][]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<{
@@ -121,6 +125,13 @@ export function Segmentation({
     setManual([]);
   }
   async function segmentAt(i: number) {
+    if (method === "wall_manual") {
+      await request(route + `/point/${i}/wall`, {
+        calcium_hu: calciumHu, wall_contour_px: manual,
+      });
+      setManual([]);
+      return;
+    }
     const result = await request(
       route + `/point/${i}` + (method === "manual" ? "/manual" : ""),
       method === "manual"
@@ -132,6 +143,7 @@ export function Segmentation({
         j === i
           ? {
               ...p,
+              wall_analysis: undefined,
               contour_mm: result.contour_mm,
               contour_px: result.contour_px,
               radius_mm: result.fitted_radius_mm,
@@ -185,7 +197,7 @@ export function Segmentation({
                 aria-label="Редактор поперечного сечения"
                 onClick={(e) => {
                   if (
-                    method !== "manual" ||
+                    !isManual ||
                     busy ||
                     e.button !== 0 ||
                     !navigation.canClick()
@@ -216,7 +228,7 @@ export function Segmentation({
                     stroke={color}
                     strokeWidth={0.7 / navigation.zoom}
                   />
-                  {method === "manual" && (
+                  {isManual && (
                     <>
                       <polyline
                         points={manual.map((p) => `${p[1]},${p[0]}`).join(" ")}
@@ -236,6 +248,12 @@ export function Segmentation({
                       ))}
                     </>
                   )}
+                  {points[index]?.wall_analysis && <g pointerEvents="none">
+                    {points[index].wall_analysis!.high_density_pixels.map(([r, c], i) =>
+                      <rect key={i} x={c - .5} y={r - .5} width={1} height={1} fill="#ffca28" opacity={.65} />)}
+                    <polygon points={points[index].wall_analysis!.wall_contour_px.map(([r, c]) => `${c},${r}`).join(" ")}
+                      fill="none" stroke="#ff80ab" strokeWidth={.7 / navigation.zoom} />
+                  </g>}
                 </g>
               </svg>
             </div>
@@ -317,9 +335,11 @@ export function Segmentation({
                   {[
                     ["auto", "Автоматически"],
                     ["threshold", "Порог"],
+                    ["fwhm", "Просвет по HU-профилю (КТА)"],
                     ["levelset", "Активный контур"],
                     ["circle", "Круг"],
                     ["manual", "Ручной контур"],
+                    ...(study.modality === "CT" ? [["wall_manual", "Ручная внешняя стенка"]] : []),
                   ].map(([v, t]) => (
                     <option key={v} value={v}>
                       {t}
@@ -335,7 +355,7 @@ export function Segmentation({
                   max={50}
                   step={0.1}
                   value={radius}
-                  disabled={busy || method === "manual"}
+                  disabled={busy || isManual}
                   onChange={(e) =>
                     setRadius(
                       Math.max(0.1, Math.min(50, +e.target.value || 0.1)),
@@ -345,7 +365,7 @@ export function Segmentation({
               </label>
             </div>
             <div className="button-row">
-              {method === "manual" && (
+              {isManual && (
                 <button
                   disabled={busy || !manual.length}
                   onClick={() => setManual((p) => p.slice(0, -1))}
@@ -355,7 +375,8 @@ export function Segmentation({
               )}
               <button
                 className="primary"
-                disabled={busy || (method === "manual" && manual.length < 3)}
+                disabled={busy || (isManual && manual.length < 3) ||
+                  (method === "wall_manual" && !points[index]?.contour_px?.length)}
                 onClick={() =>
                   action(async () => {
                     await segmentAt(index);
@@ -377,7 +398,7 @@ export function Segmentation({
                 Удалить контур
               </button>
               <button
-                disabled={busy || method === "manual"}
+                disabled={busy || isManual}
                 onClick={() =>
                   action(async () => {
                     setProgress({ done: 0, total: points.length });
@@ -391,7 +412,7 @@ export function Segmentation({
                 Обработать все сечения
               </button>
             </div>
-            {method === "manual" && (
+            {isManual && (
               <p>
                 Отметьте точки по границе сосуда, затем примените контур. Белый
                 пунктир показывает несохранённый рисунок.
@@ -412,6 +433,36 @@ export function Segmentation({
                   ? " · Обработка…"
                   : ""}
             </p>
+            <LumenMeasurements route={route} branch={branch} index={index} points={points} />
+            {study.modality === "CT" && <section aria-label="Стенка и кальций">
+              <h3>Внешняя стенка · экспериментальный контур</h3>
+              <label>Порог высокой плотности, HU
+                <input type="number" min={131} max={3000} value={calciumHu}
+                  onChange={e => setCalciumHu(+e.target.value)} />
+              </label>
+              <label>Поиск за просветом, мм
+                <input type="number" min={.5} max={6} step={.2} value={wallSearch}
+                  onChange={e => setWallSearch(+e.target.value)} />
+              </label>
+              <button disabled={busy || !points[index]?.contour_px?.length || points[index]?.method === "circle"}
+                onClick={() => action(() => request(route + `/point/${index}/wall`,
+                  { calcium_hu: calciumHu, max_thickness_mm: wallSearch }))}>
+                Найти внешнюю границу
+              </button>
+              <p>Розовый — предложение границы; жёлтый — высокая плотность.
+                Порог выбирается с учётом контрастирования КТА; это не классификация бляшки.</p>
+              {points[index]?.wall_analysis && <p>
+                Площадь между контурами: {points[index].wall_analysis!.annulus_area_mm2.toFixed(2)} мм² ·
+                Высокая плотность: {points[index].wall_analysis!.high_density_area_mm2.toFixed(2)} мм²
+                (≥{points[index].wall_analysis!.parameters.calcium_hu} HU) ·
+                {points[index].wall_analysis!.max_radial_thickness_mm != null &&
+                  <>Максимальная радиальная толщина: {points[index].wall_analysis!.max_radial_thickness_mm!.toFixed(2)} мм · </>}
+                {points[index].wall_analysis!.edge_support_fraction != null &&
+                  <>Поддержка границы: {(points[index].wall_analysis!.edge_support_fraction! * 100).toFixed(0)}%. </>}
+                {points[index].wall_analysis!.status === "manual" && "Внешняя стенка размечена вручную. "}
+                Только это сечение; результат требует проверки.
+              </p>}
+            </section>}
           </>
         )}
       </div>

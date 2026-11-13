@@ -24,6 +24,9 @@ class CaseState:
     # than re-prompting or guessing.
     series_uid: str | None = None
     display_flips: dict = field(default_factory=dict)
+    # Physical patient LPS direction in XYZ order. Viewer/editing coordinates
+    # retain their legacy ZYX convention; model I/O must preserve this matrix.
+    direction_lps: np.ndarray = field(default_factory=lambda: np.eye(3))
     # {(side, branch): [[z,y,x], ...]} — dense auto-stitched path, voxel
     # coords, rebuilt from control_points whenever one is added/moved/deleted.
     centerline_points: dict = field(default_factory=dict)

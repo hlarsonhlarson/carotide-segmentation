@@ -14,6 +14,7 @@ import uuid
 import io
 import json
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ from skimage.morphology import skeletonize
 
 from carotid_seg.treeanalysis import _build_graph
 from . import path_series, reslice, segment2d
+from .lumen_profiles import fwhm_contour
 
 
 LABELS = {
@@ -108,14 +110,19 @@ def draft_series(case, paths: dict[tuple[str, str], list[list[int]]], job) -> tu
                 case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
                 size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
                 background_value=case.array_min,
+                frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
             )
-            center = (RESLICE_SIZE_PX / 2.0, RESLICE_SIZE_PX / 2.0)
-            contour = segment2d.threshold_contour(
-                slice_2d, center, case.modality, MAX_CONTOUR_RADIUS_MM / RESLICE_PX_SPACING_MM,
-            )
+            center = ((RESLICE_SIZE_PX - 1) / 2.0,) * 2
+            if case.modality == "CT":
+                contour, profile_qa = fwhm_contour(
+                    slice_2d, center, RESLICE_PX_SPACING_MM, MAX_CONTOUR_RADIUS_MM)
+            else:
+                contour = segment2d.threshold_contour(
+                    slice_2d, center, case.modality, MAX_CONTOUR_RADIUS_MM / RESLICE_PX_SPACING_MM)
+                profile_qa = {}
             compactness, radius_mm = _contour_metrics(contour)
             if contour is None or compactness < AUTO_CONTOUR_COMPACTNESS_MIN:
-                rejected.append({"index": index, "reason": "no_contour" if contour is None else "low_compactness",
+                rejected.append({"index": index, "reason": profile_qa.get("reason", "no_contour") if contour is None else "low_compactness",
                                  "compactness": round(compactness, 3)})
                 continue
             contour_px = [[float(row), float(col)] for row, col in contour]
@@ -125,7 +132,9 @@ def draft_series(case, paths: dict[tuple[str, str], list[list[int]]], job) -> tu
                 for row, col in contour
             ]
             series[index] = {**point, "contour_px": contour_px, "contour_mm": contour_mm,
-                             "radius_mm": radius_mm, "method": "autoseed_threshold"}
+                             "radius_mm": radius_mm,
+                             "method": "autoseed_fwhm" if case.modality == "CT" else "autoseed_threshold",
+                             "profile_qa": profile_qa}
             accepted += 1
         series_by_key[key] = series
         qa[f"{key[0]}:{key[1]}"] = {
@@ -151,9 +160,10 @@ def _run(case, job):
             image = sitk.GetImageFromArray(case.array.astype(np.float32, copy=False))
             image.SetSpacing(tuple(float(v) for v in case.spacing_mm[::-1]))
             image.SetOrigin(tuple(float(v) for v in case.origin_mm[::-1]))
+            image.SetDirection(tuple(float(v) for v in case.direction_lps.ravel()))
             sitk.WriteImage(image, str(source))
             job.update(stage="segmenting", progress=15)
-            worker_url = os.environ.get("CAROTID_AUTOSEED_WORKER_URL", "http://host.docker.internal:8010/segment")
+            worker_url = os.environ.get("CAROTID_AUTOSEED_WORKER_URL", "http://host.docker.internal:8011/segment")
             request = urllib.request.Request(
                 worker_url,
                 data=source.read_bytes(),
@@ -163,6 +173,9 @@ def _run(case, job):
             try:
                 with urllib.request.urlopen(request, timeout=60 * 60) as response:
                     result = response.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Segmentation worker returned HTTP {exc.code}: {detail}") from exc
             except Exception as exc:
                 raise RuntimeError(
                     "Local automatic-segmentation worker is unavailable. Start it with "

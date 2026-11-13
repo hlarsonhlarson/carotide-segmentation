@@ -7,6 +7,16 @@ export type SegmentationPoint = {
   contour_px?: number[][];
   radius_mm?: number;
   method?: string;
+  wall_analysis?: {
+    wall_contour_px: number[][];
+    high_density_pixels: number[][];
+    annulus_area_mm2: number;
+    high_density_area_mm2: number;
+    max_radial_thickness_mm: number | null;
+    edge_support_fraction: number | null;
+    status: "proposal" | "manual";
+    parameters: { calcium_hu: number };
+  };
 };
 export type DisplayFlips = Record<string, { x: boolean; y: boolean }>;
 

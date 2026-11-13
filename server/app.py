@@ -14,6 +14,9 @@ from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 from typing import Literal
 from . import workflow, projects, storage
+from .lumen_profiles import fwhm_contour
+from .wall_analysis import analyze_wall, measure_wall_section
+from .lumen_measurements import contour_metrics, nascet_estimate
 
 from pathlib import Path
 
@@ -60,12 +63,26 @@ class ReorderRequest(BaseModel):
 
 
 class SegmentPointRequest(BaseModel):
-    method: Literal["auto", "threshold", "levelset", "circle"]  # "threshold" | "levelset" | "circle"
+    method: Literal["auto", "threshold", "levelset", "circle", "fwhm"]
     radius_mm: float = Field(gt=0, le=50, allow_inf_nan=False)
 
 
 class ManualContourRequest(BaseModel):
     contour_px: list[list[float]]  # [[row, col], ...], same pixel space as the oblique slice
+
+
+class LumenMeasurementRequest(BaseModel):
+    index: int = Field(ge=0)
+    reference_index: int | None = Field(default=None, ge=0)
+    confirmed_ica_reference: bool = False
+
+
+class WallAnalysisRequest(BaseModel):
+    calcium_hu: float = Field(gt=130, le=3000)
+    min_component_mm2: float = Field(default=.5, gt=0, le=20)
+    min_thickness_mm: float = Field(default=.3, gt=0, lt=6)
+    max_thickness_mm: float = Field(default=6, gt=0, le=6)
+    wall_contour_px: list[list[float]] | None = None
 
 
 class SU2ParamsRequest(BaseModel):
@@ -147,9 +164,11 @@ def _load_dicom_case(path: str, series_uid: str | None):
             if len(available) != 1:
                 raise HTTPException(400, "Choose a DICOM series explicitly")
             series_uid = available[0]["series_uid"]
-        array, spacing_mm, origin_mm, modality, flips = dicom_io.load_series(
-            path, series_uid, include_display_flips=True
+        loaded = dicom_io.load_series(
+            path, series_uid, include_display_flips=True, include_geometry=True
         )
+        array, spacing_mm, origin_mm, modality, flips = loaded[:5]
+        direction_lps = loaded[5] if len(loaded) > 5 else np.eye(3)
     except HTTPException:
         raise
     except FileNotFoundError as e:
@@ -162,6 +181,7 @@ def _load_dicom_case(path: str, series_uid: str | None):
 
     case = cases.create(array, spacing_mm, origin_mm, modality, str(Path(path).expanduser().resolve()), series_uid=series_uid)
     case.display_flips = flips
+    case.direction_lps = direction_lps
     wl, ww = case.default_window
     info = {
         "case_id": case.case_id,
@@ -171,6 +191,7 @@ def _load_dicom_case(path: str, series_uid: str | None):
         "modality": modality,
         "default_window": {"wl": wl, "ww": ww},
         "display_flips": case.display_flips,
+        "direction_lps": case.direction_lps.tolist(),
     }
     return case, info
 
@@ -197,6 +218,7 @@ def get_meta(case_id: str):
         "source_path": case.source_path,
         "default_window": {"wl": wl, "ww": ww},
         "display_flips": case.display_flips,
+        "direction_lps": case.direction_lps.tolist(),
     }
 
 
@@ -583,6 +605,7 @@ def get_segment_slice(case_id: str, side: str, branch: str, index: int,
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
         background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
     )
     if wl is None or ww is None:
         wl, ww = case.default_window
@@ -596,24 +619,93 @@ def get_segment_slice(case_id: str, side: str, branch: str, index: int,
     return Response(content=png, media_type="image/png", headers=headers)
 
 
+@app.post("/cases/{case_id}/segment/{side}/{branch}/point/{index}/wall")
+@workflow.edit
+def propose_wall(case_id: str, side: str, branch: str, index: int, req: WallAnalysisRequest):
+    case, series = _get_series_point(case_id, side, branch, index)
+    point = series[index]
+    if case.modality != "CT" or point.get("method") == "circle" or not point.get("contour_px"):
+        raise HTTPException(422, "A measured CTA lumen contour is required")
+    image, u, v, origin = reslice.sample_oblique_slice(
+        case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
+        size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
+    )
+    try:
+        parameters = req.model_dump(exclude={"wall_contour_px"})
+        if req.wall_contour_px is None:
+            result = analyze_wall(image, point["contour_px"], RESLICE_PX_SPACING_MM, **parameters)
+        else:
+            result = measure_wall_section(image, point["contour_px"], req.wall_contour_px,
+                                          RESLICE_PX_SPACING_MM, req.calcium_hu, req.min_component_mm2)
+            result.update(status="manual", validated=False, parameters=parameters,
+                          algorithm_version="manual-wall-section-1",
+                          max_radial_thickness_mm=None, edge_support_fraction=None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    result["wall_contour_mm"] = [
+        (origin + c * RESLICE_PX_SPACING_MM * u + r * RESLICE_PX_SPACING_MM * v).tolist()
+        for r, c in result["wall_contour_px"]
+    ]
+    point["wall_analysis"] = result
+    return result
+
+
+@app.post("/cases/{case_id}/segment/{side}/{branch}/measurements")
+@workflow.locked
+def measure_lumen(case_id: str, side: str, branch: str, req: LumenMeasurementRequest):
+    _, series = _get_series_point(case_id, side, branch, req.index)
+
+    def measure(index):
+        if index >= len(series):
+            raise HTTPException(422, "Section index is outside the current series")
+        point = series[index]
+        if point.get("method") == "circle":
+            raise HTTPException(422, "An estimated circle cannot be used to measure stenosis")
+        try:
+            return contour_metrics(point.get("contour_mm", []))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    result = {"index": req.index, "section": measure(req.index), "nascet": None}
+    if req.reference_index is not None:
+        if branch != "cca_ica" or not req.confirmed_ica_reference:
+            raise HTTPException(422, "Confirm lesion in ICA and a normal distal ICA reference")
+        if req.reference_index <= req.index:
+            raise HTTPException(422, "Reference must follow the lesion on the CCA to ICA path")
+        result["reference"] = measure(req.reference_index)
+        result["reference_index"] = req.reference_index
+        try:
+            result["nascet"] = nascet_estimate(result["section"], result["reference"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    return result
+
+
 @app.post("/cases/{case_id}/segment/{side}/{branch}/point/{index}")
 @workflow.edit
 def segment_point(case_id: str, side: str, branch: str, index: int, req: SegmentPointRequest):
-    if req.method not in ("threshold", "levelset", "circle", "auto"):
-        raise HTTPException(status_code=400, detail="method must be 'threshold', 'levelset', 'circle', or 'auto'")
+    if req.method not in ("threshold", "levelset", "circle", "auto", "fwhm"):
+        raise HTTPException(status_code=400, detail="Unknown contour method")
     case, series = _get_series_point(case_id, side, branch, index)
     point = series[index]
     slice_2d, u_vec, v_vec, grid_origin = reslice.sample_oblique_slice(
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
         background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
     )
-    center_px = (RESLICE_SIZE_PX / 2.0, RESLICE_SIZE_PX / 2.0)
+    center_px = ((RESLICE_SIZE_PX - 1) / 2.0,) * 2
     max_radius_px = MAX_CONTOUR_RADIUS_MM / RESLICE_PX_SPACING_MM
     effective_method = req.method
 
     try:
-        if req.method == "threshold":
+        if req.method == "fwhm":
+            if case.modality != "CT":
+                raise HTTPException(400, "FWHM HU profiles require CT")
+            contour_px, _ = fwhm_contour(slice_2d, center_px, RESLICE_PX_SPACING_MM, MAX_CONTOUR_RADIUS_MM)
+        elif req.method == "threshold":
             contour_px = segment2d.threshold_contour(slice_2d, center_px, case.modality, max_radius_px)
         elif req.method == "circle":
             # Not a detected wall at all — a perfect circle at the
@@ -621,27 +713,21 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
             radius_px = max(req.radius_mm, 0.5) / RESLICE_PX_SPACING_MM
             contour_px = segment2d.circle_contour(center_px, radius_px)
         elif req.method == "auto":
-            # Used to seed every point right after a Series is prepared:
-            # really try a real detection first, and only fall back to a
-            # plain circle when the result doesn't look like a
-            # trustworthy vessel cross-section — not "always draw
-            # circles", which would throw away real detections that are
-            # already correct. CT has a real HU cliff to grow against
-            # (Threshold); MR doesn't, so Level Set's gradient-following
-            # is the better default there.
+            # Failed detection stays unsegmented. A circle is available only
+            # through the explicitly selected manual approximation method.
             radius_px = max(req.radius_mm, 1.0) / RESLICE_PX_SPACING_MM
             if case.modality == "CT":
                 contour_px = segment2d.threshold_contour(slice_2d, center_px, case.modality, max_radius_px)
             else:
                 contour_px = segment2d.levelset_contour(slice_2d, center_px, radius_px, max_radius_px)
             if contour_px is None or _contour_compactness(contour_px) < AUTO_SEED_COMPACTNESS_MIN:
-                contour_px = segment2d.circle_contour(center_px, radius_px)
-                effective_method = "circle"
-            else:
-                effective_method = "levelset"
+                contour_px = None
+            effective_method = "threshold" if case.modality == "CT" else "levelset"
         else:
             radius_px = max(req.radius_mm, 1.0) / RESLICE_PX_SPACING_MM
             contour_px = segment2d.levelset_contour(slice_2d, center_px, radius_px, max_radius_px)
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("segmentation failed for %s/%s/%s point %d", case_id, side, branch, index)
         raise HTTPException(status_code=400, detail=f"segmentation failed: {e}")
@@ -659,7 +745,7 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
 
     workflow.invalidate(case, side)
     series[index] = {
-        **point,
+        **{k: v for k, v in point.items() if k != "wall_analysis"},
         "contour_px": contour_px_list,
         "contour_mm": contour_mm,
         "radius_mm": fitted_radius_mm,
@@ -690,6 +776,7 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
         background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
     )
     contour_px_list = [[float(r), float(c)] for r, c in req.contour_px]
     contour_mm = [
@@ -701,7 +788,7 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
 
     workflow.invalidate(case, side)
     series[index] = {
-        **point,
+        **{k: v for k, v in point.items() if k != "wall_analysis"},
         "contour_px": contour_px_list,
         "contour_mm": contour_mm,
         "radius_mm": fitted_radius_mm,
@@ -723,7 +810,7 @@ def delete_segment_point(case_id: str, side: str, branch: str, index: int):
     case, series = _get_series_point(case_id, side, branch, index)
     point = series[index]
     workflow.invalidate(case, side)
-    series[index] = {"point_mm": point["point_mm"], "tangent_mm": point["tangent_mm"]}
+    series[index] = {k: point[k] for k in ("point_mm", "tangent_mm", "u_vec", "v_vec") if k in point}
     return {"side": side, "branch": branch, "index": index}
 
 

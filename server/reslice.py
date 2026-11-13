@@ -28,7 +28,7 @@ def _orthonormal_in_plane_axes(tangent_mm):
 
 def sample_oblique_slice(array: np.ndarray, spacing_mm, origin_mm, point_mm, tangent_mm,
                           size_px: int = 160, px_spacing_mm: float = 0.25,
-                          background_value: float | None = None):
+                          background_value: float | None = None, frame=None):
     """Samples a size_px x size_px plane perpendicular to tangent_mm,
     centered at point_mm (both world-mm, (z,y,x)-axis-ordered like the rest
     of this codebase), via trilinear interpolation.
@@ -40,7 +40,7 @@ def sample_oblique_slice(array: np.ndarray, spacing_mm, origin_mm, point_mm, tan
     for PNG export (row-major, row 0 = one edge of the plane).
     """
     point = np.asarray(point_mm, dtype=np.float64)
-    u, v = _orthonormal_in_plane_axes(tangent_mm)
+    u, v = _orthonormal_in_plane_axes(tangent_mm) if frame is None else np.asarray(frame, dtype=float)
 
     half = size_px / 2.0
     offsets = (np.arange(size_px) - half + 0.5) * px_spacing_mm  # pixel-center offsets

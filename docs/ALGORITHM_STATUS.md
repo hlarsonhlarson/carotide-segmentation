@@ -1,0 +1,78 @@
+# Algorithm implementation status
+
+This tracks implementation, not clinical validation. Synthetic tests do not
+establish accuracy on patient CTA.
+
+## Implemented in the current working tree
+
+- DICOM sorting uses the slice-normal projection of ImagePositionPatient.
+- Classic stacks and enhanced multi-frame functional groups are checked for
+  duplicate positions, missing/irregular slice steps, mixed orientations,
+  inconsistent pixel sizes, non-spatial frame order and sheared grids before
+  decoding. Unsupported grids are rejected instead of averaging their spacing.
+- Loaded cases retain the DICOM direction matrix. NIfTI input to the model
+  includes that direction, spacing and origin.
+- Returned canonical labels are resampled onto the original input grid using
+  nearest-neighbor interpolation.
+- Projects record the XYZ-to-LPS affine and a patient-space copy of centerlines.
+  Existing viewer and editing coordinates remain legacy ZYX millimetres.
+- Arc-length resampling interpolates at the requested interval instead of
+  skipping original vertices.
+- New contour series store rotation-minimizing frames. Image sampling and
+  both automatic and manual contour conversion use those same frames.
+  Old series without frames retain their previous sampling basis.
+- The CTA radial half-height method measures lumen contours and rejects missing
+  edges, unenhanced centers and bright outer peaks. It is available in the
+  editor and used for automatic CTA drafts.
+- Failed automatic 2D segmentation no longer silently inserts a circle.
+- The editor displays lumen area, equivalent diameter and minimum/maximum
+  Feret diameters. A diameter-ratio NASCET estimate requires explicit operator
+  selection of a normal distal ICA reference and an ICA lesion. Invalid rings
+  and estimated circle contours cannot be used. This is not a validated
+  clinical NASCET measurement method or an automatic near-occlusion detector.
+- Worker inference runs outside the event loop, rejects concurrent jobs, and
+  configures PyTorch threading once per process.
+- HTTP errors from the worker preserve their actual details.
+
+## Remaining implementation and validation
+
+0. Complete migration of legacy annotations/surfaces to LPS; resampling or
+   explicit contiguous-stack selection for rejected irregular/sheared DICOM
+   series; optional isotropic processing grids restricted to ROI.
+1. Validate Fast seeds and component filtering on representative CTA.
+2. Validate ICA/ECA labeling and endpoint selection; implement explicit
+   bifurcation uncertainty instead of assuming every tree is anatomically valid.
+3. Expose MPR sampling parameters and verify all real-case reformats.
+4. Validate the radial method on stenoses; longitudinal intensity reference and
+   confidence-aware smoothing must preserve genuine diameter minima.
+5–7. Experimental sectional outer-wall proposals use cyclic radial optimization,
+   edge-support and search-limit rejection. The editor overlays the proposed
+   boundary and high-density components with an explicit CTA HU threshold;
+   results/parameters persist and are invalidated by lumen edits.
+   Manual outer-wall tracing is supported when detection fails, with checks
+   for nested nonintersecting rings. Manual results carry no detector confidence.
+   Reported areas are 2D, not calcium volumes. Plaque-component classification,
+   longitudinal wall regularization and expert validation remain pending.
+   Contrast CTA must not use 130 HU as an unconditional calcium threshold.
+   Estimated wall thickness must not be represented as a measured boundary.
+   The implemented NASCET estimate needs validation against expert measurements;
+   it requires an explicitly selected normal distal ICA reference.
+8. Ophthalmic artery tracing and optional outlet support are NOT implemented.
+9. Surface/volume meshing exists; prism boundary layers and three-level mesh
+   convergence are not established by this change.
+10. SU2 export/run/postprocessing exists; outlet calibration and periodic-cycle
+    convergence need independent verification.
+11. Expert-reference Dice/HD95, observer repeatability and CFD sensitivity runs
+    require reference segmentations and completed simulation experiments.
+
+## Checks
+
+`python -m pytest -q tests server/tests` and `npm run build` in `frontend`.
+Geometry tests include asymmetric labels through NIfTI canonicalization,
+rotated/reflected LPS transforms and pixel-center MPR consistency.
+
+Header-only checks of the local studies found regular grids in the 379-slice
+and 238-slice series. The 269-file series has 267 intervals of 1 mm and one
+interval of 59 mm; it is rejected until a contiguous stack is explicitly
+selected or the source series is corrected. This check does not establish
+segmentation accuracy.
