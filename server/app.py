@@ -16,6 +16,7 @@ from typing import Literal
 from . import workflow, projects, storage
 from .lumen_profiles import fwhm_contour
 from .wall_analysis import analyze_wall, measure_wall_section
+from .longitudinal_analysis import analyze_series
 from .lumen_measurements import contour_metrics, nascet_estimate
 
 from pathlib import Path
@@ -83,6 +84,12 @@ class WallAnalysisRequest(BaseModel):
     min_thickness_mm: float = Field(default=.3, gt=0, lt=6)
     max_thickness_mm: float = Field(default=6, gt=0, le=6)
     wall_contour_px: list[list[float]] | None = None
+
+
+class LongitudinalAnalysisRequest(BaseModel):
+    start_index: int = Field(default=0, ge=0)
+    end_index: int | None = Field(default=None, ge=0)
+    max_step_mm: float = Field(default=4., gt=0, le=10)
 
 
 class SU2ParamsRequest(BaseModel):
@@ -650,6 +657,24 @@ def propose_wall(case_id: str, side: str, branch: str, index: int, req: WallAnal
     ]
     point["wall_analysis"] = result
     return result
+
+
+@app.delete("/cases/{case_id}/segment/{side}/{branch}/point/{index}/wall")
+@workflow.edit
+def delete_wall(case_id: str, side: str, branch: str, index: int):
+    _, series = _get_series_point(case_id, side, branch, index)
+    series[index].pop("wall_analysis", None)
+    return {"side": side, "branch": branch, "index": index}
+
+
+@app.post("/cases/{case_id}/segment/{side}/{branch}/profile")
+@workflow.locked
+def longitudinal_profile(case_id: str, side: str, branch: str, req: LongitudinalAnalysisRequest):
+    _, series = _get_series_point(case_id, side, branch, req.start_index)
+    try:
+        return analyze_series(series, req.start_index, req.end_index, req.max_step_mm)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.post("/cases/{case_id}/segment/{side}/{branch}/measurements")

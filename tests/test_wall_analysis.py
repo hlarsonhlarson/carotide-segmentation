@@ -78,6 +78,10 @@ def test_wall_endpoint_persists_and_lumen_edits_invalidate(monkeypatch):
             assert response.status_code == 200, response.text
             assert response.json()["status"] == "manual"
             assert response.json()["edge_support_fraction"] is None
+            assert client.delete(route + "/wall").status_code == 200
+            assert "wall_analysis" not in case.segmentation_series["right", "cca_ica"][0]
+            assert case.segmentation_series["right", "cca_ica"][0]["contour_px"] == lumen.tolist()
+            assert client.post(route + "/wall", json={"calcium_hu": 600}).status_code == 200
             assert client.post(route + "/manual", json={"contour_px": lumen.tolist()}).status_code == 200
             assert "wall_analysis" not in case.segmentation_series["right", "cca_ica"][0]
             assert client.delete(route).status_code == 200

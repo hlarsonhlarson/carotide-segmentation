@@ -34,6 +34,7 @@ def test_nascet_uses_diameter_not_area():
     [[0, 0, 0], [0, 0, 0], [0, 1, 0]],
     [[0, 0, 0], [0, 1, 0], [0, 2, 0]],
     [[0, 0, 0], [0, 1, 0], [np.nan, 0, 1]],
+    [[0, 0, 0], [0, 3, 0], [0, 3, 3], [0, 1, 0], [0, 0, 3]],
 ])
 def test_invalid_contours_do_not_produce_measurements(ring):
     with pytest.raises(ValueError):

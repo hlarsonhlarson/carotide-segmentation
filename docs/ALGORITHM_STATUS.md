@@ -30,6 +30,18 @@ establish accuracy on patient CTA.
   selection of a normal distal ICA reference and an ICA lesion. Invalid rings
   and estimated circle contours cannot be used. This is not a validated
   clinical NASCET measurement method or an automatic near-occlusion detector.
+- A longitudinal profile plots area at each measured section, with explicit
+  gaps and navigation to the minimum area or minimum Feret diameter in a
+  selected range. Minima are not automatically classified as ICA stenoses.
+- Trapezoidal section integrals estimate lumen, annular and high-density volumes
+  over covered intervals only. Outputs include covered/selected lengths and
+  excluded intervals. Missing contours, estimated circles, excessive sample
+  gaps and tangent changes above 30 degrees are excluded. High-density totals
+  require identical HU/component-size parameters throughout the selected range.
+  These are sampled estimates, not voxel-mask volumes or plaque composition.
+- Batch outer-wall detection processes unfilled sections, retains existing
+  boundaries, reports failed sections and can stop after the current request.
+  Outer-wall annotations can be removed independently of the lumen.
 - Worker inference runs outside the event loop, rejects concurrent jobs, and
   configures PyTorch threading once per process.
 - HTTP errors from the worker preserve their actual details.
@@ -51,7 +63,8 @@ establish accuracy on patient CTA.
    results/parameters persist and are invalidated by lumen edits.
    Manual outer-wall tracing is supported when detection fails, with checks
    for nested nonintersecting rings. Manual results carry no detector confidence.
-   Reported areas are 2D, not calcium volumes. Plaque-component classification,
+   Sectional areas remain 2D; longitudinal integrals are coverage-limited
+   estimates, not validated calcium volumes. Plaque-component classification,
    longitudinal wall regularization and expert validation remain pending.
    Contrast CTA must not use 130 HU as an unconditional calcium threshold.
    Estimated wall thickness must not be represented as a measured boundary.

@@ -3,10 +3,14 @@ import { useImageNavigation } from "./useImageNavigation";
 import { SegmentationPreview } from "./SegmentationPreview";
 import { branchColors } from "./PathPreview";
 import { LumenMeasurements } from "./LumenMeasurements";
+import { LongitudinalProfile } from "./LongitudinalProfile";
 import type {
   SegmentationPoint,
   SegmentationChange,
 } from "./segmentationGeometry";
+export class RequestError extends Error {
+  constructor(message: string, public status: number) { super(message); }
+}
 export async function request(path: string, body?: unknown, method = "POST") {
   const response = await fetch(
     "/api" + path,
@@ -20,10 +24,10 @@ export async function request(path: string, body?: unknown, method = "POST") {
   );
   if (!response.ok) {
     const error = await response.json();
-    throw Error(
+    throw new RequestError(
       typeof error.detail === "string"
         ? error.detail
-        : JSON.stringify(error.detail),
+        : JSON.stringify(error.detail), response.status,
     );
   }
   return response.json();
@@ -53,6 +57,9 @@ export function Segmentation({
   const [radius, setRadius] = useState(3);
   const [calciumHu, setCalciumHu] = useState(600);
   const [wallSearch, setWallSearch] = useState(6);
+  const stopWallBatch = useRef(false);
+  const [wallBatch, setWallBatch] = useState(false);
+  const [wallFailures, setWallFailures] = useState<{ index: number; reason: string }[]>([]);
   const [manual, setManual] = useState<number[][]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<{
@@ -69,6 +76,10 @@ export function Segmentation({
   const navigation = useImageNavigation(160, 160);
   const content = useRef<SVGGElement>(null);
   const route = `${base}/segment/${side}/${branch}`;
+  useEffect(() => {
+    setWallFailures([]);
+    return () => { stopWallBatch.current = true; };
+  }, [route]);
   const color = branchColors[branch];
   function publish(next: SegmentationPoint[]) {
     latestPoints.current = next;
@@ -151,6 +162,33 @@ export function Segmentation({
           : p,
       ),
     );
+  }
+  async function fillMissingWalls() {
+    const candidates = points.flatMap((p, i) =>
+      p.contour_px?.length && p.method !== "circle" && !p.wall_analysis ? [i] : []);
+    const failures: { index: number; reason: string }[] = [];
+    stopWallBatch.current = false;
+    setWallBatch(true);
+    setWallFailures([]);
+    setProgress({ done: 0, total: candidates.length });
+    try {
+      for (let j = 0; j < candidates.length; j++) {
+        if (stopWallBatch.current) break;
+        const i = candidates[j];
+        try {
+          await request(route + `/point/${i}/wall`, {
+            calcium_hu: calciumHu, max_thickness_mm: wallSearch,
+          });
+        } catch (e) {
+          if (!(e instanceof RequestError) || e.status !== 422) throw e;
+          failures.push({ index: i, reason: e.message });
+          setWallFailures([...failures]);
+        }
+        setProgress({ done: j + 1, total: candidates.length });
+      }
+    } finally {
+      setWallBatch(false);
+    }
   }
   const accepted = points.filter((p) => p.contour_px?.length).length;
   return (
@@ -449,6 +487,24 @@ export function Segmentation({
                   { calcium_hu: calciumHu, max_thickness_mm: wallSearch }))}>
                 Найти внешнюю границу
               </button>
+              <button disabled={busy || !points.some(p => p.contour_px?.length && p.method !== "circle" && !p.wall_analysis)}
+                onClick={() => action(fillMissingWalls)}>
+                Найти стенку на незаполненных сечениях
+              </button>
+              <button disabled={busy || !points[index]?.wall_analysis}
+                onClick={() => action(() => request(route + `/point/${index}/wall`, {}, "DELETE"))}>
+                Удалить только внешнюю стенку
+              </button>
+              {wallBatch && <button onClick={() => { stopWallBatch.current = true; }}>
+                Остановить после текущего сечения
+              </button>}
+              {!!wallFailures.length && <details>
+                <summary>Стенка не найдена: {wallFailures.length} сечений</summary>
+                <ul>{wallFailures.map(failure => <li key={failure.index}>
+                  <button disabled={busy} onClick={() => goTo(failure.index)}>Сечение {failure.index + 1}</button>
+                  {" "}{failure.reason}
+                </li>)}</ul>
+              </details>}
               <p>Розовый — предложение границы; жёлтый — высокая плотность.
                 Порог выбирается с учётом контрастирования КТА; это не классификация бляшки.</p>
               {points[index]?.wall_analysis && <p>
@@ -463,6 +519,8 @@ export function Segmentation({
                 Только это сечение; результат требует проверки.
               </p>}
             </section>}
+            <LongitudinalProfile route={route} points={points} index={index}
+              onSelect={goTo} disabled={busy} />
           </>
         )}
       </div>
