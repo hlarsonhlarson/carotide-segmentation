@@ -65,8 +65,10 @@ export function Segmentation({
   const [fatHu, setFatHu] = useState(-50);
   const [showComposition, setShowComposition] = useState(true);
   const wallParams = { calcium_hu: calciumHu, lipid_hu: lipidHu, fat_hu: fatHu };
-  const stopWallBatch = useRef(false);
-  const [wallBatch, setWallBatch] = useState(false);
+  // Plaque is segmented only in the operator-confirmed stenosis zone.
+  const [zone, setZone] = useState<{ start: number; end: number } | null>(null);
+  const [zoneMm, setZoneMm] = useState(10);
+  const [zoneResult, setZoneResult] = useState<any>(null);
   const [wallFailures, setWallFailures] = useState<{ index: number; reason: string }[]>([]);
   const [manual, setManual] = useState<number[][]>([]);
   const [busy, setBusy] = useState(false);
@@ -86,7 +88,8 @@ export function Segmentation({
   const route = `${base}/segment/${side}/${branch}`;
   useEffect(() => {
     setWallFailures([]);
-    return () => { stopWallBatch.current = true; };
+    setZone(null);
+    setZoneResult(null);
   }, [route]);
   const color = branchColors[branch];
   function publish(next: SegmentationPoint[]) {
@@ -171,32 +174,30 @@ export function Segmentation({
       ),
     );
   }
-  async function fillMissingWalls() {
-    const candidates = points.flatMap((p, i) =>
-      p.contour_px?.length && p.method !== "circle" && !p.wall_analysis ? [i] : []);
-    const failures: { index: number; reason: string }[] = [];
-    stopWallBatch.current = false;
-    setWallBatch(true);
-    setWallFailures([]);
-    setProgress({ done: 0, total: candidates.length });
-    try {
-      for (let j = 0; j < candidates.length; j++) {
-        if (stopWallBatch.current) break;
-        const i = candidates[j];
-        try {
-          await request(route + `/point/${i}/wall`, {
-            ...wallParams, max_thickness_mm: wallSearch,
-          });
-        } catch (e) {
-          if (!(e instanceof RequestError) || e.status !== 422) throw e;
-          failures.push({ index: i, reason: e.message });
-          setWallFailures([...failures]);
-        }
-        setProgress({ done: j + 1, total: candidates.length });
-      }
-    } finally {
-      setWallBatch(false);
+  // Suggest the zone as sections within zoneMm of the narrowest measured
+  // lumen (smallest area-equivalent radius) along this path.
+  function suggestZone() {
+    const measured = points.flatMap((p, i) =>
+      p.contour_px?.length && p.method !== "circle" && p.radius_mm ? [i] : []);
+    if (!measured.length) return;
+    const narrowest = measured.reduce((a, b) => (points[b].radius_mm! < points[a].radius_mm! ? b : a));
+    const arc = [0];
+    for (let i = 1; i < points.length; i++) {
+      const [a, b] = [points[i - 1].point_mm, points[i].point_mm];
+      arc.push(arc[i - 1] + Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]));
     }
+    const inside = points.flatMap((_, i) => (Math.abs(arc[i] - arc[narrowest]) <= zoneMm ? [i] : []));
+    setZone({ start: inside[0], end: inside[inside.length - 1] });
+    goTo(narrowest);
+  }
+  async function segmentZone() {
+    if (!zone) return;
+    const result = await request(route + "/plaque_zone", {
+      ...wallParams, max_thickness_mm: wallSearch, start_index: zone.start, end_index: zone.end,
+    });
+    setZoneResult(result);
+    setWallFailures(result.problems.map((p: { index: number; problem: string }) =>
+      ({ index: p.index, reason: p.problem })));
   }
   const accepted = points.filter((p) => p.contour_px?.length).length;
   return (
@@ -509,19 +510,52 @@ export function Segmentation({
                   { ...wallParams, max_thickness_mm: wallSearch }))}>
                 Найти внешнюю границу
               </button>
-              <button disabled={busy || !points.some(p => p.contour_px?.length && p.method !== "circle" && !p.wall_analysis)}
-                onClick={() => action(fillMissingWalls)}>
-                Найти стенку на незаполненных сечениях
-              </button>
+              <div className="plaque-zone">
+                <strong>Бляшка в зоне стеноза.</strong> Стенка и состав считаются только в выбранной
+                зоне; вне её результаты бляшки убираются: нормальная стенка по HU выглядела бы как
+                фиброзная бляшка.
+                <div className="button-row">
+                  <label>± от сужения, мм
+                    <input type="number" min={2} max={40} step={1} value={zoneMm}
+                      onChange={e => setZoneMm(Math.max(2, Math.min(40, +e.target.value || 10)))} />
+                  </label>
+                  <button disabled={busy || !points.some(p => p.radius_mm)} onClick={suggestZone}>
+                    Предложить зону у сужения
+                  </button>
+                  <label>с
+                    <input type="number" min={1} max={points.length} value={zone ? zone.start + 1 : ""}
+                      onChange={e => setZone({ start: Math.max(0, Math.min(points.length - 1, +e.target.value - 1)),
+                        end: zone?.end ?? points.length - 1 })} />
+                  </label>
+                  <label>по
+                    <input type="number" min={1} max={points.length} value={zone ? zone.end + 1 : ""}
+                      onChange={e => setZone({ start: zone?.start ?? 0,
+                        end: Math.max(0, Math.min(points.length - 1, +e.target.value - 1)) })} />
+                  </label>
+                  <button className="primary" disabled={busy || !zone || zone.start > zone.end}
+                    onClick={() => action(segmentZone)}>
+                    Сегментировать бляшку в зоне
+                  </button>
+                </div>
+                {zoneResult && <p>
+                  Сечения {zoneResult.start_index + 1}–{zoneResult.end_index + 1}
+                  {" "}({zoneResult.selected_length_mm.toFixed(1)} мм): стенка найдена на {zoneResult.analysed}.
+                  {(["plaque", "calcified", "lipid", "fibrous"] as const).map(key => {
+                    const v = zoneResult.integrals[key].volume_mm3;
+                    return <span key={key}> {{ plaque: "Бляшка", calcified: "кальций", lipid: "атерома",
+                      fibrous: "фиброзная" }[key]}: {v == null ? "—" : `${v.toFixed(1)} мм³`}.</span>;
+                  })}
+                  {zoneResult.minimum_area_index != null && <> Минимальная площадь просвета — сечение{" "}
+                    <button disabled={busy} onClick={() => goTo(zoneResult.minimum_area_index)}>
+                      {zoneResult.minimum_area_index + 1}</button>.</>}
+                </p>}
+              </div>
               <button disabled={busy || !points[index]?.wall_analysis}
                 onClick={() => action(() => request(route + `/point/${index}/wall`, {}, "DELETE"))}>
                 Удалить только внешнюю стенку
               </button>
-              {wallBatch && <button onClick={() => { stopWallBatch.current = true; }}>
-                Остановить после текущего сечения
-              </button>}
               {!!wallFailures.length && <details>
-                <summary>Стенка не найдена: {wallFailures.length} сечений</summary>
+                <summary>Стенка не найдена в зоне: {wallFailures.length} сечений</summary>
                 <ul>{wallFailures.map(failure => <li key={failure.index}>
                   <button disabled={busy} onClick={() => goTo(failure.index)}>Сечение {failure.index + 1}</button>
                   {" "}{failure.reason}

@@ -116,3 +116,28 @@ def test_manual_wall_outside_image_or_inside_lumen_rejected():
     for wall in ((lumen - 80) * .5 + 80, lumen + 200):
         with pytest.raises(ValueError):
             measure_wall_section(image, lumen, wall, .15, 600)
+
+
+def test_plaque_zone_analyses_only_the_chosen_sections(monkeypatch):
+    from server import app as backend, cases
+    image, lumen = phantom(calcium=True)
+    case = cases.create(np.zeros((5, 5, 5)), np.ones(3), np.zeros(3), "CT", "synthetic")
+    contour_mm = [[z, *(np.asarray(p) * .15)] for z, p in zip([0.] * len(lumen), lumen)]
+    series = [{"point_mm": [float(z), 2., 2.], "tangent_mm": [1., 0., 0.],
+               "u_vec": [0., 1., 0.], "v_vec": [0., 0., 1.], "method": "threshold",
+               "contour_px": lumen.tolist(),
+               "contour_mm": [[float(z), c[1], c[2]] for c in contour_mm]} for z in range(6)]
+    series[0]["wall_analysis"] = {"stale": True}
+    case.segmentation_series["right", "cca_ica"] = series
+    monkeypatch.setattr(backend, "RESLICE_PX_SPACING_MM", .15)
+    monkeypatch.setattr(backend.reslice, "sample_oblique_slice",
+                        lambda *args, **kwargs: (image, np.array([0., 1., 0.]), np.array([0., 0., 1.]), np.zeros(3)))
+    try:
+        result = backend.segment_plaque_zone(case.case_id, "right", "cca_ica",
+                                             backend.PlaqueZoneRequest(calcium_hu=600, start_index=2, end_index=3))
+        assert result["analysed"] == 2 and not result["problems"]
+        assert [("wall_analysis" in p) for p in series] == [False, False, True, True, False, False]
+        assert series[2]["wall_analysis"]["composition"]["calcified_area_mm2"] > 0
+        assert result["integrals"]["plaque"]["volume_mm3"] > 0
+    finally:
+        cases._CASES.pop(case.case_id, None)

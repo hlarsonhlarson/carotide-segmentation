@@ -94,6 +94,14 @@ establish accuracy on patient CTA.
   calcified and atheromatous pixels in 3D, and the longitudinal profile has
   CCA / bifurcation / ICA / ECA range buttons for per-part volumes.
 
+- Plaque is segmented only in a stenosis zone (`.../plaque_zone`): outer
+  wall and composition are found on the chosen sections and removed
+  elsewhere on the branch, since on a normal segment the HU bands would report
+  normal wall as fibrous plaque. The editor suggests the zone as sections
+  within +/-10 mm (adjustable) of the narrowest lumen; the operator confirms
+  or edits it. The narrowest lumen is not a validated stenosis detector: a
+  naturally small distal artery can be narrower than a mild lesion.
+
 ## Remaining implementation and validation
 
 0. Complete migration of legacy annotations/surfaces to LPS; resampling or

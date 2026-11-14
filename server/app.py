@@ -101,6 +101,11 @@ class WallAnalysisRequest(BaseModel):
         return self
 
 
+class PlaqueZoneRequest(WallAnalysisRequest):
+    start_index: int = Field(ge=0)
+    end_index: int = Field(ge=0)
+
+
 class LongitudinalAnalysisRequest(BaseModel):
     start_index: int = Field(default=0, ge=0)
     end_index: int | None = Field(default=None, ge=0)
@@ -671,7 +676,11 @@ def get_segment_slice(case_id: str, side: str, branch: str, index: int,
 @workflow.edit
 def propose_wall(case_id: str, side: str, branch: str, index: int, req: WallAnalysisRequest):
     case, series = _get_series_point(case_id, side, branch, index)
-    point = series[index]
+    return _analyze_point_wall(case, series[index], req)
+
+
+def _analyze_point_wall(case, point, req: WallAnalysisRequest):
+    """Outer wall and plaque composition of one section; raises 422 if not found."""
     if case.modality != "CT" or point.get("method") == "circle" or not point.get("contour_px"):
         raise HTTPException(422, "A measured CTA lumen contour is required")
     image, u, v, origin = reslice.sample_oblique_slice(
@@ -707,6 +716,40 @@ def propose_wall(case_id: str, side: str, branch: str, index: int, req: WallAnal
                                "v": np.asarray(v).tolist(), "px_mm": RESLICE_PX_SPACING_MM}
     point["wall_analysis"] = result
     return result
+
+
+@app.post("/cases/{case_id}/segment/{side}/{branch}/plaque_zone")
+@workflow.edit
+def segment_plaque_zone(case_id: str, side: str, branch: str, req: PlaqueZoneRequest):
+    """Plaque only where the stenosis is.
+
+    Outer wall and composition are found on the sections of the chosen zone;
+    plaque results elsewhere on this branch are removed, because on a normal
+    segment the wall-to-lumen region is normal wall that the HU bands would
+    report as fibrous plaque.
+    """
+    case, series = _get_series_point(case_id, side, branch, req.start_index)
+    if not req.start_index <= req.end_index < len(series):
+        raise HTTPException(422, "choose a zone within the section series")
+    problems = []
+    wall_request = WallAnalysisRequest(**req.model_dump(exclude={"start_index", "end_index"}))
+    for i, point in enumerate(series):
+        if not req.start_index <= i <= req.end_index:
+            point.pop("wall_analysis", None)
+            continue
+        try:
+            _analyze_point_wall(case, point, wall_request)
+        except HTTPException as exc:
+            point.pop("wall_analysis", None)
+            problems.append({"index": i, "problem": exc.detail})
+    profile = analyze_series(series, req.start_index, req.end_index)
+    summary = {key: profile["integrals"][key] for key in ("lumen", "plaque", "calcified", "lipid", "fibrous")}
+    return {"start_index": req.start_index, "end_index": req.end_index,
+            "analysed": req.end_index - req.start_index + 1 - len(problems),
+            "problems": problems, "integrals": summary,
+            "minimum_area_index": profile["minimum_area_index"],
+            "minimum_diameter_index": profile["minimum_diameter_index"],
+            "selected_length_mm": profile["selected_length_mm"]}
 
 
 @app.delete("/cases/{case_id}/segment/{side}/{branch}/point/{index}/wall")
