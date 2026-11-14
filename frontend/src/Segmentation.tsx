@@ -5,6 +5,7 @@ import { branchColors } from "./PathPreview";
 import { LumenMeasurements } from "./LumenMeasurements";
 import { LongitudinalProfile } from "./LongitudinalProfile";
 import type {
+  PlaqueComposition,
   SegmentationPoint,
   SegmentationChange,
 } from "./segmentationGeometry";
@@ -57,6 +58,10 @@ export function Segmentation({
   const [radius, setRadius] = useState(3);
   const [calciumHu, setCalciumHu] = useState(600);
   const [wallSearch, setWallSearch] = useState(6);
+  const [lipidHu, setLipidHu] = useState(50);
+  const [fatHu, setFatHu] = useState(-50);
+  const [showComposition, setShowComposition] = useState(true);
+  const wallParams = { calcium_hu: calciumHu, lipid_hu: lipidHu, fat_hu: fatHu };
   const stopWallBatch = useRef(false);
   const [wallBatch, setWallBatch] = useState(false);
   const [wallFailures, setWallFailures] = useState<{ index: number; reason: string }[]>([]);
@@ -138,7 +143,7 @@ export function Segmentation({
   async function segmentAt(i: number) {
     if (method === "wall_manual") {
       await request(route + `/point/${i}/wall`, {
-        calcium_hu: calciumHu, wall_contour_px: manual,
+        ...wallParams, wall_contour_px: manual,
       });
       setManual([]);
       return;
@@ -177,7 +182,7 @@ export function Segmentation({
         const i = candidates[j];
         try {
           await request(route + `/point/${i}/wall`, {
-            calcium_hu: calciumHu, max_thickness_mm: wallSearch,
+            ...wallParams, max_thickness_mm: wallSearch,
           });
         } catch (e) {
           if (!(e instanceof RequestError) || e.status !== 422) throw e;
@@ -287,8 +292,10 @@ export function Segmentation({
                     </>
                   )}
                   {points[index]?.wall_analysis && <g pointerEvents="none">
-                    {points[index].wall_analysis!.high_density_pixels.map(([r, c], i) =>
-                      <rect key={i} x={c - .5} y={r - .5} width={1} height={1} fill="#ffca28" opacity={.65} />)}
+                    {showComposition && points[index].wall_analysis!.composition
+                      ? <PlaqueOverlay composition={points[index].wall_analysis!.composition!} />
+                      : points[index].wall_analysis!.high_density_pixels.map(([r, c], i) =>
+                        <rect key={i} x={c - .5} y={r - .5} width={1} height={1} fill="#ffca28" opacity={.65} />)}
                     <polygon points={points[index].wall_analysis!.wall_contour_px.map(([r, c]) => `${c},${r}`).join(" ")}
                       fill="none" stroke="#ff80ab" strokeWidth={.7 / navigation.zoom} />
                   </g>}
@@ -474,9 +481,21 @@ export function Segmentation({
             <LumenMeasurements route={route} branch={branch} index={index} points={points} />
             {study.modality === "CT" && <section aria-label="Стенка и кальций">
               <h3>Внешняя стенка · экспериментальный контур</h3>
-              <label>Порог высокой плотности, HU
+              <label>Кальций от, HU (не ниже 1,3 × HU просвета)
                 <input type="number" min={131} max={3000} value={calciumHu}
                   onChange={e => setCalciumHu(+e.target.value)} />
+              </label>
+              <label>Атероматозный компонент ниже, HU
+                <input type="number" min={-100} max={130} value={lipidHu}
+                  onChange={e => setLipidHu(+e.target.value)} />
+              </label>
+              <label>Жир и воздух ниже, HU
+                <input type="number" min={-300} max={129} value={fatHu}
+                  onChange={e => setFatHu(+e.target.value)} />
+              </label>
+              <label className="checkbox">
+                <input type="checkbox" checked={showComposition}
+                  onChange={e => setShowComposition(e.target.checked)} /> Показывать состав бляшки
               </label>
               <label>Поиск за просветом, мм
                 <input type="number" min={.5} max={6} step={.2} value={wallSearch}
@@ -484,7 +503,7 @@ export function Segmentation({
               </label>
               <button disabled={busy || !points[index]?.contour_px?.length || points[index]?.method === "circle"}
                 onClick={() => action(() => request(route + `/point/${index}/wall`,
-                  { calcium_hu: calciumHu, max_thickness_mm: wallSearch }))}>
+                  { ...wallParams, max_thickness_mm: wallSearch }))}>
                 Найти внешнюю границу
               </button>
               <button disabled={busy || !points.some(p => p.contour_px?.length && p.method !== "circle" && !p.wall_analysis)}
@@ -505,8 +524,15 @@ export function Segmentation({
                   {" "}{failure.reason}
                 </li>)}</ul>
               </details>}
-              <p>Розовый — предложение границы; жёлтый — высокая плотность.
-                Порог выбирается с учётом контрастирования КТА; это не классификация бляшки.</p>
+              <p>Розовый — внешняя граница. Состав бляшки: <span style={{ color: PLAQUE_COLORS.calcified }}>■</span> кальцинированный
+                (≥ порога высокой плотности), <span style={{ color: PLAQUE_COLORS.lipid }}>■</span> атероматозный
+                (низкая плотность), <span style={{ color: PLAQUE_COLORS.fibrous }}>■</span> фиброзный (остальное).
+                Классификация по HU на КТА экспериментальна: кальций «расплывается», а контраст
+                частично заходит в низкие значения. Результат требует проверки.</p>
+              {points[index]?.wall_analysis && !points[index].wall_analysis!.composition &&
+                <p>Состав для этого сечения не рассчитан: стенка найдена старой версией. Найдите её заново.</p>}
+              {points[index]?.wall_analysis?.composition && <CompositionSummary
+                composition={points[index].wall_analysis!.composition!} />}
               {points[index]?.wall_analysis && <p>
                 Площадь между контурами: {points[index].wall_analysis!.annulus_area_mm2.toFixed(2)} мм² ·
                 Высокая плотность: {points[index].wall_analysis!.high_density_area_mm2.toFixed(2)} мм²
@@ -534,4 +560,38 @@ export function Segmentation({
       />
     </section>
   );
+}
+
+const PLAQUE_COLORS = { calcified: "#ef5350", lipid: "#ffd54f", fibrous: "#66bb6a" };
+
+function pixelPath(pixels: number[][]) {
+  return pixels.map(([r, c]) => `M${c - .5},${r - .5}h1v1h-1z`).join("");
+}
+
+function PlaqueOverlay({ composition }: { composition: PlaqueComposition }) {
+  return <>
+    <path d={pixelPath(composition.fibrous_pixels)} fill={PLAQUE_COLORS.fibrous} opacity={.35} />
+    <path d={pixelPath(composition.lipid_pixels)} fill={PLAQUE_COLORS.lipid} opacity={.7} />
+    <path d={pixelPath(composition.calcified_pixels)} fill={PLAQUE_COLORS.calcified} opacity={.85} />
+  </>;
+}
+
+function CompositionSummary({ composition: c }: { composition: PlaqueComposition }) {
+  const share = (value: number) => c.plaque_area_mm2 > 0 ? ` (${(100 * value / c.plaque_area_mm2).toFixed(0)}%)` : "";
+  return <p>
+    Бляшка/стенка: {c.plaque_area_mm2.toFixed(2)} мм² ·
+    кальцинированная: {c.calcified_area_mm2.toFixed(2)} мм²{share(c.calcified_area_mm2)} ·
+    атероматозная: {c.lipid_area_mm2.toFixed(2)} мм²{share(c.lipid_area_mm2)} ·
+    фиброзная: {c.fibrous_area_mm2.toFixed(2)} мм²{share(c.fibrous_area_mm2)}.
+    {c.calcium_in_lumen_area_mm2 > 0 &&
+      <> Кальций внутри контура просвета: {c.calcium_in_lumen_area_mm2.toFixed(2)} мм² — площадь просвета завышена. </>}
+    {c.contrast_partial_volume_area_mm2 > 0 &&
+      <> Размытый край контраста (≥{c.parameters.fibrous_max_hu} HU, не бляшка): {c.contrast_partial_volume_area_mm2.toFixed(2)} мм². </>}
+    {c.excluded_low_hu_area_mm2 > 0 &&
+      <> Ниже {c.parameters.fat_hu} HU (жир/воздух, не бляшка): {c.excluded_low_hu_area_mm2.toFixed(2)} мм². </>}
+    {" "}Пороги: атерома &lt; {c.parameters.lipid_hu} HU, фиброзная до {c.parameters.fibrous_max_hu} HU,
+    кальций ≥ {c.calcium_hu_effective.toFixed(0)} HU{c.lumen_reference_hu != null &&
+      ` (просвет ≈ ${c.lumen_reference_hu.toFixed(0)} HU)`};
+    атерома не ищется ближе {c.parameters.edge_margin_mm} мм к внешней границе.
+  </p>;
 }

@@ -8,6 +8,7 @@ from scipy import ndimage as ndi
 from skimage.draw import polygon
 from skimage.measure import points_in_poly
 from .lumen_measurements import contour_metrics
+from .plaque_composition import DEFAULTS as COMPOSITION_DEFAULTS, classify_plaque
 
 
 def _ray_radii(contour, center, theta, pixel_mm):
@@ -58,7 +59,8 @@ def _closed_boundary(cost, radii, max_jump_mm=.75, smoothness=.5):
     return best_path
 
 
-def measure_wall_section(image, lumen_px, wall_px, pixel_mm, calcium_hu, min_component_mm2=.5):
+def measure_wall_section(image, lumen_px, wall_px, pixel_mm, calcium_hu, min_component_mm2=.5,
+                         composition=None):
     """Measure a pair of nested, nonintersecting rings, independent of detection."""
     image, lumen, wall = (np.asarray(value, dtype=float) for value in (image, lumen_px, wall_px))
     if (image.ndim != 2 or not np.isfinite(image).all()
@@ -93,7 +95,10 @@ def measure_wall_section(image, lumen_px, wall_px, pixel_mm, calcium_hu, min_com
     keep = counts * pixel_mm**2 >= min_component_mm2
     keep[0] = False
     high_density = keep[labels]
+    composition = {**COMPOSITION_DEFAULTS, **(composition or {})}
     return {
+        "composition": classify_plaque(image, lumen_mask, wall_mask, pixel_mm, calcium_hu,
+                                       min_component_mm2, **composition),
         "wall_contour_px": wall.tolist(),
         "high_density_pixels": np.argwhere(high_density).tolist(),
         "annulus_area_mm2": float(annulus.sum() * pixel_mm**2),
@@ -102,7 +107,8 @@ def measure_wall_section(image, lumen_px, wall_px, pixel_mm, calcium_hu, min_com
 
 
 def analyze_wall(image, lumen_px, pixel_mm, calcium_hu, min_component_mm2=.5,
-                 min_thickness_mm=.3, max_thickness_mm=6.):
+                 min_thickness_mm=.3, max_thickness_mm=6., composition=None,
+                 soft_tissue_max_hu=None):
     image = np.asarray(image, dtype=float)
     lumen = np.asarray(lumen_px, dtype=float)
     if (image.ndim != 2 or not np.isfinite(image).all() or
@@ -127,6 +133,11 @@ def analyze_wall(image, lumen_px, pixel_mm, calcium_hu, min_component_mm2=.5,
     # A bright structure is not an outer-wall landmark. Exclude it from the
     # boundary reward rather than following a bone/calcium edge.
     valid = np.isfinite(gradient) & (inside < calcium_hu) & (outside < calcium_hu)
+    if soft_tissue_max_hu is not None:
+        # The contrast lumen's own blurred edge is the strongest gradient just
+        # outside a lumen contour; without this the boundary locks onto it.
+        # Non-calcified wall and plaque stay below this attenuation.
+        valid &= inside < soft_tissue_max_hu
     cost = np.where(valid, -np.clip(gradient / 100., -2., 2.), np.inf)
     chosen = _closed_boundary(cost, radii)
     strengths = gradient[np.arange(len(theta)), chosen]
@@ -139,7 +150,7 @@ def analyze_wall(image, lumen_px, pixel_mm, calcium_hu, min_component_mm2=.5,
     wall = np.column_stack((center[0] + np.sin(theta) * outer / pixel_mm,
                             center[1] + np.cos(theta) * outer / pixel_mm))
     return {
-        **measure_wall_section(image, lumen, wall, pixel_mm, calcium_hu, min_component_mm2),
+        **measure_wall_section(image, lumen, wall, pixel_mm, calcium_hu, min_component_mm2, composition),
         "max_radial_thickness_mm": float((outer - inner).max()),
         "edge_support_fraction": confidence,
         "status": "proposal", "validated": False,

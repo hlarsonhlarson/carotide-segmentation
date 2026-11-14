@@ -14,10 +14,18 @@ type Integral = {
 type Profile = {
   sections: Section[]; selected_length_mm: number;
   minimum_area_index: number | null; minimum_diameter_index: number | null;
-  integrals: Record<"lumen" | "annulus" | "high_density", Integral>;
+  integrals: Record<IntegralKey, Integral>;
   density_parameters: { calcium_hu: number; min_component_mm2: number } | null;
+  composition_parameters: { calcium_hu: number; lipid_hu: number; fat_hu: number } | null;
+};
+type IntegralKey = "lumen" | "annulus" | "high_density" | "plaque" | "calcified" | "lipid" | "fibrous";
+const integralLabels: Record<IntegralKey, string> = {
+  lumen: "Просвет", annulus: "Между просветом и стенкой", high_density: "Высокая плотность",
+  plaque: "Бляшка/стенка (состав)", calcified: "· кальцинированная", lipid: "· атероматозная",
+  fibrous: "· фиброзная",
 };
 const reasons: Record<string, string> = {
+  different_composition_parameters: "Разные пороги состава бляшки",
   duplicate_position: "Совпадающие позиции",
   sampling_gap: "Большой шаг между сечениями",
   invalid_frame: "Некорректная плоскость",
@@ -104,10 +112,10 @@ export function LongitudinalProfile({ route, points, index, onSelect, disabled }
           onClick={() => onSelect(profile.minimum_diameter_index!)}>К минимуму диаметра Фере</button>
       </div>
       <p>Минимумы относятся к выбранному диапазону; это не автоматический выбор стеноза ICA.</p>
-      {(["lumen", "annulus", "high_density"] as const).map(key => {
+      {(Object.keys(integralLabels) as IntegralKey[]).map(key => {
         const value = profile.integrals[key];
         return <div key={key}>
-          <strong>{{ lumen: "Просвет", annulus: "Между просветом и стенкой", high_density: "Высокая плотность" }[key]}: </strong>
+          <strong>{integralLabels[key]}: </strong>
           {value.volume_mm3 === null ? "нет достаточных данных" : `${value.volume_mm3.toFixed(2)} мм³`}
           <span> · покрыто {value.covered_length_mm.toFixed(1)} из {profile.selected_length_mm.toFixed(1)} мм</span>
           {!!value.excluded_intervals.length && <details>
@@ -122,6 +130,8 @@ export function LongitudinalProfile({ route, points, index, onSelect, disabled }
       })}
       {profile.density_parameters && <p>Порог высокой плотности: {profile.density_parameters.calcium_hu} HU;
         минимальная площадь компонента: {profile.density_parameters.min_component_mm2} мм².</p>}
+      {profile.composition_parameters && <p>Состав бляшки: атерома &lt; {profile.composition_parameters.lipid_hu} HU,
+        кальций ≥ {profile.composition_parameters.calcium_hu} HU, жир &lt; {profile.composition_parameters.fat_hu} HU.</p>}
       <p>Приближённое интегрирование площадей, без заполнения пропусков.
         Не объём воксельной маски и не классификация бляшки. Области бифуркации и
         пересекающиеся сечения требуют проверки; объёмы перекрывающихся ветвей не суммируются.</p>

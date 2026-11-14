@@ -1,5 +1,20 @@
 import * as THREE from "three";
 
+export type PlaqueComposition = {
+  plaque_area_mm2: number;
+  calcified_area_mm2: number;
+  lipid_area_mm2: number;
+  fibrous_area_mm2: number;
+  excluded_low_hu_area_mm2: number;
+  contrast_partial_volume_area_mm2: number;
+  calcium_hu_effective: number;
+  lumen_reference_hu: number | null;
+  calcium_in_lumen_area_mm2: number;
+  calcified_pixels: number[][];
+  lipid_pixels: number[][];
+  fibrous_pixels: number[][];
+  parameters: { calcium_hu: number; lipid_hu: number; fat_hu: number; fibrous_max_hu: number; edge_margin_mm: number };
+};
 export type SegmentationPoint = {
   point_mm: number[];
   tangent_mm: number[];
@@ -16,6 +31,7 @@ export type SegmentationPoint = {
     edge_support_fraction: number | null;
     status: "proposal" | "manual";
     parameters: { calcium_hu: number };
+    composition?: PlaqueComposition;
   };
 };
 export type DisplayFlips = Record<string, { x: boolean; y: boolean }>;

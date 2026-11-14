@@ -4,6 +4,22 @@ import numpy as np
 from .lumen_measurements import contour_metrics
 
 
+_COMPOSITION_FIELDS = ("plaque_area_mm2", "calcified_area_mm2", "lipid_area_mm2", "fibrous_area_mm2")
+
+
+def _composition_areas(composition):
+    """Validated per-section composition areas, or None for older results."""
+    if not composition:
+        return None
+    try:
+        values = [float(composition[k]) for k in _COMPOSITION_FIELDS]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not np.isfinite(values).all() or min(values) < 0 or sum(values[1:]) > values[0] + 1e-6:
+        return None
+    return {**dict(zip(_COMPOSITION_FIELDS, values)), "parameters": dict(composition.get("parameters", {}))}
+
+
 def analyze_series(series, start=0, end=None, max_step_mm=4.):
     end = len(series) - 1 if end is None else end
     if not 0 <= start <= end < len(series):
@@ -18,7 +34,8 @@ def analyze_series(series, start=0, end=None, max_step_mm=4.):
     sections = []
     for index in range(start, end + 1):
         point = series[index]
-        section = {"index": index, "distance_mm": float(arc[index]), "lumen": None, "wall": None}
+        section = {"index": index, "distance_mm": float(arc[index]), "lumen": None, "wall": None,
+                   "plaque": None}
         try:
             if point.get("method") == "circle":
                 raise ValueError("Estimated circle")
@@ -38,12 +55,17 @@ def analyze_series(series, start=0, end=None, max_step_mm=4.):
                     "status": wall.get("status", "proposal"),
                     "parameters": wall.get("parameters", {}),
                 }
+                section["plaque"] = _composition_areas(wall.get("composition"))
         sections.append(section)
 
     fields = {
         "lumen": ("lumen", "area_mm2"),
         "annulus": ("wall", "annulus_area_mm2"),
         "high_density": ("wall", "high_density_area_mm2"),
+        "plaque": ("plaque", "plaque_area_mm2"),
+        "calcified": ("plaque", "calcified_area_mm2"),
+        "lipid": ("plaque", "lipid_area_mm2"),
+        "fibrous": ("plaque", "fibrous_area_mm2"),
     }
     totals = {key: {"volume_mm3": None, "covered_length_mm": 0., "intervals": 0,
                     "excluded_intervals": []} for key in fields}
@@ -55,6 +77,9 @@ def analyze_series(series, start=0, end=None, max_step_mm=4.):
     consistent_density = len(density_parameters) == 1 and all(
         value is not None and np.isfinite(value)
         for pair in density_parameters for value in pair)
+    composition_parameters = {
+        tuple(sorted(s["plaque"]["parameters"].items())) for s in sections if s["plaque"] is not None}
+    consistent_composition = len(composition_parameters) == 1
     for left, right in zip(sections, sections[1:]):
         i = left["index"]
         step = steps[i]
@@ -81,6 +106,8 @@ def analyze_series(series, start=0, end=None, max_step_mm=4.):
             if reason is None and name == "high_density":
                 if not consistent_density:
                     reason = "different_density_parameters"
+            if reason is None and group == "plaque" and not consistent_composition:
+                reason = "different_composition_parameters"
             total = totals[name]
             if reason:
                 total["excluded_intervals"].append({"from_index": i, "to_index": i + 1, "reason": reason})
@@ -98,6 +125,7 @@ def analyze_series(series, start=0, end=None, max_step_mm=4.):
         "integrals": totals, "max_step_mm": max_step_mm,
         "density_parameters": dict(zip(("calcium_hu", "min_component_mm2"), next(iter(density_parameters))))
         if consistent_density else None,
+        "composition_parameters": dict(next(iter(composition_parameters))) if consistent_composition else None,
         "method": "trapezoidal_section_integral", "validated": False,
         "limitations": "Sampled estimates, not voxel volumes or plaque classification. "
                        "No interpolation across missing sections, gaps or sharp turns. "

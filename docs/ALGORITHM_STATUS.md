@@ -64,6 +64,19 @@ establish accuracy on patient CTA.
   the estimate uses boundary nodal velocities, not conservative numerical
   fluxes from the solver, so it is not a residual convergence certificate.
 
+- Experimental sectional plaque composition (`server/plaque_composition.py`)
+  splits the wall region into calcified, low-attenuation (atheromatous
+  candidate) and fibrous pixels by HU. The calcium threshold is at least
+  1.3x the median lumen HU, so a bright lumen is never called calcium;
+  calcium inside the lumen contour is counted as plaque and reported. Pixels
+  of 150 HU and above outside the lumen (blurred contrast) and below -50 HU
+  (fat/air) are excluded. Low-attenuation pixels within 0.5 mm of the outer
+  wall are not called atheroma. Volumes use the same coverage-limited
+  section integral. The outer-wall search now ignores edges whose inner side
+  exceeds 100 HU; previously it locked onto the blurred lumen edge on real
+  CTA and failed on every section. HU bands are approximations: no
+  histological or clinical validation; a normal wall is reported as fibrous.
+
 ## Remaining implementation and validation
 
 0. Complete migration of legacy annotations/surfaces to LPS; resampling or

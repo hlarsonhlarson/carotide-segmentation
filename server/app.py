@@ -85,6 +85,20 @@ class WallAnalysisRequest(BaseModel):
     min_thickness_mm: float = Field(default=.3, gt=0, lt=6)
     max_thickness_mm: float = Field(default=6, gt=0, le=6)
     wall_contour_px: list[list[float]] | None = None
+    # Plaque composition (server/plaque_composition.py); experimental HU bands.
+    lipid_hu: float = Field(default=50, ge=-100, le=130)
+    fat_hu: float = Field(default=-50, ge=-300, lt=130)
+    fibrous_max_hu: float = Field(default=150, gt=0, le=300)
+    edge_margin_mm: float = Field(default=.5, ge=0, le=2)
+    # Outer-wall search ignores edges whose inner side is brighter than this:
+    # those belong to the blurred contrast lumen, not to the outer wall.
+    soft_tissue_max_hu: float | None = Field(default=100, gt=0, le=300)
+
+    @model_validator(mode="after")
+    def _ordered_thresholds(self):
+        if not self.fat_hu < self.lipid_hu < self.fibrous_max_hu < self.calcium_hu:
+            raise ValueError("thresholds must satisfy fat_hu < lipid_hu < fibrous_max_hu < calcium_hu")
+        return self
 
 
 class LongitudinalAnalysisRequest(BaseModel):
@@ -641,12 +655,17 @@ def propose_wall(case_id: str, side: str, branch: str, index: int, req: WallAnal
         frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
     )
     try:
-        parameters = req.model_dump(exclude={"wall_contour_px"})
+        composition_keys = {"lipid_hu", "fat_hu", "fibrous_max_hu", "edge_margin_mm"}
+        composition = req.model_dump(include=composition_keys)
+        parameters = req.model_dump(exclude={"wall_contour_px", "soft_tissue_max_hu"} | composition_keys)
         if req.wall_contour_px is None:
-            result = analyze_wall(image, point["contour_px"], RESLICE_PX_SPACING_MM, **parameters)
+            result = analyze_wall(image, point["contour_px"], RESLICE_PX_SPACING_MM, **parameters,
+                                  composition=composition, soft_tissue_max_hu=req.soft_tissue_max_hu)
+            result["parameters"]["soft_tissue_max_hu"] = req.soft_tissue_max_hu
         else:
             result = measure_wall_section(image, point["contour_px"], req.wall_contour_px,
-                                          RESLICE_PX_SPACING_MM, req.calcium_hu, req.min_component_mm2)
+                                          RESLICE_PX_SPACING_MM, req.calcium_hu, req.min_component_mm2,
+                                          composition)
             result.update(status="manual", validated=False, parameters=parameters,
                           algorithm_version="manual-wall-section-1",
                           max_radial_thickness_mm=None, edge_support_fraction=None)

@@ -27,7 +27,9 @@ def test_missing_section_does_not_bridge_gap_or_count_wall():
     series = tube()
     series[1].pop("contour_mm")
     result = analyze_series(series)
-    for value in result["integrals"].values():
+    # Composition integrals have no data in this legacy-style series.
+    for key in ("lumen", "annulus", "high_density"):
+        value = result["integrals"][key]
         assert value["covered_length_mm"] == 2
         assert value["intervals"] == 1
         assert len(value["excluded_intervals"]) == 2
