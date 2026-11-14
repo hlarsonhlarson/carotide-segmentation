@@ -27,7 +27,8 @@ def _orthonormal_in_plane_axes(tangent_mm):
 
 
 def sample_oblique_slice(array: np.ndarray, spacing_mm, origin_mm, point_mm, tangent_mm,
-                          size_px: int = 160, px_spacing_mm: float = 0.25):
+                          size_px: int = 160, px_spacing_mm: float = 0.25,
+                          background_value: float | None = None, frame=None):
     """Samples a size_px x size_px plane perpendicular to tangent_mm,
     centered at point_mm (both world-mm, (z,y,x)-axis-ordered like the rest
     of this codebase), via trilinear interpolation.
@@ -39,7 +40,7 @@ def sample_oblique_slice(array: np.ndarray, spacing_mm, origin_mm, point_mm, tan
     for PNG export (row-major, row 0 = one edge of the plane).
     """
     point = np.asarray(point_mm, dtype=np.float64)
-    u, v = _orthonormal_in_plane_axes(tangent_mm)
+    u, v = _orthonormal_in_plane_axes(tangent_mm) if frame is None else np.asarray(frame, dtype=float)
 
     half = size_px / 2.0
     offsets = (np.arange(size_px) - half + 0.5) * px_spacing_mm  # pixel-center offsets
@@ -55,5 +56,7 @@ def sample_oblique_slice(array: np.ndarray, spacing_mm, origin_mm, point_mm, tan
     voxel = world_to_voxel(world, spacing_mm, origin_mm)
     coords = [voxel[..., 0], voxel[..., 1], voxel[..., 2]]  # z, y, x
 
-    slice_2d = ndi.map_coordinates(array, coords, order=1, mode="constant", cval=float(array.min()))
+    if background_value is None:
+        background_value = float(array.min())
+    slice_2d = ndi.map_coordinates(array, coords, order=1, mode="constant", cval=background_value)
     return slice_2d.astype(np.float32), u, v, grid_origin_world_mm

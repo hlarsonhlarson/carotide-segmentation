@@ -13,10 +13,24 @@ def root(kind):
 
 def allowed_path(value, kind):
     variable = 'CAROTID_DICOM_ROOT' if kind == 'dicom' else 'CAROTID_PROJECTS_ROOT'
-    path = Path(value).expanduser().resolve()
+    path = Path(value).expanduser()
+    alias = os.environ.get(variable + '_ALIAS')
+    if alias and path.is_relative_to(Path(alias)):
+        path = root(kind) / path.relative_to(Path(alias))
+    path = path.resolve()
     if os.environ.get(variable) and not path.is_relative_to(root(kind)):
         raise HTTPException(403, 'Folder is outside the mounted data directory')
     return path
+
+
+def portable_path(value, kind):
+    """Store container-compatible source paths when the backend runs natively."""
+    variable = 'CAROTID_DICOM_ROOT' if kind == 'dicom' else 'CAROTID_PROJECTS_ROOT'
+    alias = os.environ.get(variable + '_ALIAS')
+    path = Path(value).expanduser().resolve()
+    if alias and path.is_relative_to(root(kind)):
+        return str(Path(alias) / path.relative_to(root(kind)))
+    return str(value)
 
 
 @router.get('/storage')

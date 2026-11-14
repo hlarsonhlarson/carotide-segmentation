@@ -17,12 +17,14 @@ DIMENSIONAL, CFL=1 first-order for stability, etc).
 import json
 import logging
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
-import signal
-from .config import SU2_BIN_DIR, MPI_PYTHON
 from pathlib import Path
+
+from .config import SU2_BIN_DIR, MPI_PYTHON
 
 import numpy as np
 
@@ -48,6 +50,13 @@ MMHG_TO_PA = 133.322
 
 
 def mpi_processes() -> int:
+    # Multi-rank OpenMPI on macOS has repeatedly hung in MPI_Win_create
+    # even with osc=sm. Prefer one rank locally; operators can override.
+    override = os.environ.get("CAROTID_MPI_N")
+    if override:
+        return max(1, int(override))
+    if sys.platform == "darwin":
+        return 1
     return max(1, min(8, os.cpu_count() or 4))
 
 
@@ -164,6 +173,12 @@ def run_in_background(job: dict, run_dir: Path, cfg_path: Path, params_path: Pat
         return
     env = os.environ.copy()
     env["PYTHONPATH"] = SU2_BIN_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    # macOS OpenMPI/PMIx: listener bind and RDMA one-sided windows hang
+    # without these. Keep any values the operator already exported.
+    env.setdefault("OMPI_MCA_btl", "self,tcp")
+    env.setdefault("OMPI_MCA_pml", "ob1")
+    env.setdefault("OMPI_MCA_osc", "sm")
+    env.setdefault("PMIX_MCA_gds", "hash")
     n_procs = mpi_processes()
     cmd = ["mpirun", "-n", str(n_procs), MPI_PYTHON, RUNNER_SCRIPT, str(cfg_path), str(params_path)]
     job["cmd"] = " ".join(cmd)

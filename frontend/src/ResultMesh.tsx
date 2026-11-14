@@ -15,7 +15,7 @@ export function ResultMesh({
     const parent = host.current;
     if (!parent) return;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color("#101925");
+    scene.background = new THREE.Color("#344152");
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute(
       "position",
@@ -52,6 +52,11 @@ export function ResultMesh({
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     parent.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.DOLLY,
+    };
     controls.update();
     const resize = new ResizeObserver(() => {
       renderer.setSize(parent.clientWidth, 420);

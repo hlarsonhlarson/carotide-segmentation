@@ -30,22 +30,35 @@ def atomic_write(path, data):
 
 
 def snapshot(case):
+    from .coordinates import voxel_to_lps
+    affine = np.eye(4)
+    affine[:3, :3] = case.direction_lps @ np.diag(case.spacing_mm[::-1])
+    affine[:3, 3] = case.origin_mm[::-1]
     return {
         'format_version': FORMAT_VERSION, 'project_id': case.project_id,
-        'source_path': case.source_path, 'series_uid': case.series_uid,
+        'source_path': storage.portable_path(case.source_path, 'dicom'), 'series_uid': case.series_uid,
         'geometry': {'shape': list(case.array.shape), 'spacing_mm': case.spacing_mm.tolist(),
-                     'origin_mm': case.origin_mm.tolist(), 'coordinate_system': 'zyx-mm'},
+                     'origin_mm': case.origin_mm.tolist(), 'coordinate_system': 'zyx-mm',
+                     'direction_lps': case.direction_lps.tolist(),
+                     'affine_xyz_to_lps': affine.tolist()},
+        'algorithm': {'version': 'geometry-fwhm-1', 'lumen_method': 'radial_half_height',
+                      'model_total_mode': 'fast', 'clinical_validation': False},
         'revisions': case.revisions,
         'stale': {s: sorted(v) for s, v in case.stale.items()},
         'sides': {side: {
             'branches': {branch: {
                 'control_points': case.control_points.get((side, branch), []),
                 'centerline_points': case.centerline_points.get((side, branch), []),
+                'centerline_lps_mm': voxel_to_lps(
+                    case.centerline_points[(side, branch)], case.spacing_mm,
+                    case.origin_mm, case.direction_lps).tolist()
+                    if case.centerline_points.get((side, branch)) else [],
                 'segmentation': case.segmentation_series.get((side, branch), []),
             } for branch in workflow.BRANCHES},
             'params': case.su2_params.get(side),
         } for side in workflow.SIDES},
         'artifacts': case.saved_artifacts, 'warnings': case.project_warnings,
+        'autoseed_review': case.autoseed_review,
     }
 
 
@@ -193,9 +206,12 @@ def restore(case, manifest, folder):
     if (geometry['shape'] != list(case.array.shape)
             or not np.allclose(geometry['spacing_mm'], case.spacing_mm)
             or not np.allclose(geometry['origin_mm'], case.origin_mm)
+            or ('direction_lps' in geometry and
+                not np.allclose(geometry['direction_lps'], case.direction_lps))
             or geometry.get('coordinate_system') != 'zyx-mm'):
         raise HTTPException(409, 'Source image geometry has changed; original project was not modified.')
     case.project_warnings = list(manifest.get('warnings', []))
+    case.autoseed_review = dict(manifest.get('autoseed_review', {}))
     case.project_id = manifest['project_id']
     case.revisions = manifest['revisions']
     case.stale = {s: set(manifest.get('stale', {}).get(s, [])) for s in workflow.SIDES}

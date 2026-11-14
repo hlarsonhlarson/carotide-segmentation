@@ -58,6 +58,9 @@ export function CFD({
     : [];
   useEffect(() => {
     let active = true;
+    setResult(null);
+    setFrame(0);
+    setPost("idle");
     request(route + "/su2_params")
       .then((p) => {
         if (active) setParams(p);
@@ -77,6 +80,7 @@ export function CFD({
         if (active) {
           setStatus(s);
           setPost(p.state);
+          if (p.state !== "done") setResult(null);
         }
       } catch (e) {
         if (active) onError(String(e));
@@ -158,6 +162,14 @@ export function CFD({
           `· ${status.step} / ${status.total_steps}`}
       </p>
       {status.error && <p role="alert">{status.error}</p>}
+      {status.q_inlet_mlps != null && <p>
+        Расход, мл/с: вход {status.q_inlet_mlps.toFixed(2)} ·
+        ICA {status.q_ica_mlps.toFixed(2)} · ECA {status.q_eca_mlps.toFixed(2)}.
+        {" "}Невязка массы: {status.mass_imbalance_relative == null
+          ? "относительная не определена" : `${(status.mass_imbalance_relative * 100).toFixed(2)}%`}.
+        {(status.inlet_reversed || status.ica_reversed || status.eca_reversed) && " Обнаружен обратный поток."}
+        {(status.ica_pressure_clamped || status.eca_pressure_clamped) && " Сработало ограничение давления."}
+      </p>}
       <button
         disabled={busy || post === "running" || status.state === "idle"}
         onClick={() => action(() => request(route + "/su2_postprocess", {}))}
@@ -180,6 +192,46 @@ export function CFD({
           <p>
             Вычисление завершено. Физическая достоверность ещё не подтверждена.
           </p>
+          {result.temporal_quality ? <section aria-label="Периодичность CFD">
+            <h3>Проверка последних циклов</h3>
+            <p>Интервал усреднения: {result.temporal_quality.window_start_s.toFixed(3)}–
+              {result.temporal_quality.window_end_s.toFixed(3)} с
+              {" "}({result.temporal_quality.full_cycle ? "полный цикл" : "неполный цикл"}).</p>
+            <p>{({
+              insufficient_cycles: "Недостаточно данных для сравнения двух полных циклов.",
+              sparse_sampling: "Снимки сохранены слишком редко для проверки периодичности.",
+              insufficient_signal: "Недостаточный сигнал для относительного сравнения.",
+              within_tolerance: "Глобальное RMS-различие двух циклов находится в пределах допуска.",
+              not_periodic: "Различие двух последних циклов превышает допуск.",
+            } as Record<string, string>)[result.temporal_quality.status]}</p>
+            <p>Допуск RMS: {(result.temporal_quality.relative_tolerance * 100).toFixed(1)}%.
+              Это проверка временной повторяемости полей, не сходимости сетки или калибровки границ.</p>
+            {result.temporal_quality.comparison && ["wss", "pressure"].map(name => {
+              const metric = result.temporal_quality.comparison[name];
+              return <p key={name}>{name === "wss" ? "Вектор WSS" : "Давление"}:
+                {" "}RMS-различие {metric.rms_difference_pa.toPrecision(3)} Па ·
+                относительное {metric.relative_rms == null ? "не определено" : `${(metric.relative_rms * 100).toFixed(2)}%`} ·
+                максимум по компонентам {metric.max_component_difference_pa.toPrecision(3)} Па.
+              </p>;
+            })}
+            {result.temporal_quality.undefined_osi_nodes > 0 && <p>
+              OSI не определён в {result.temporal_quality.undefined_osi_nodes} узлах с нулевым WSS;
+              для отображения используется 0. Маска валидности включена в JSON.
+            </p>}
+          </section> : <p>В сохранённом результате нет проверки периодичности. Повторите обработку исходных кадров.</p>}
+          {result.flow_balance?.status === "measured" ? <section aria-label="Баланс потока CFD">
+            <h3>Баланс потока</h3>
+            <p>Оценка по узловым скоростям на границах; это не невязка консервативных численных потоков решателя.</p>
+            <p>Средняя абсолютная невязка: {result.flow_balance.mean_absolute_imbalance_mlps.toPrecision(3)} мл/с ·
+              относительная {result.flow_balance.relative_mean_absolute_imbalance == null ? "не определена"
+                : `${(result.flow_balance.relative_mean_absolute_imbalance * 100).toFixed(2)}%`}.</p>
+            <p>Объём за {result.flow_balance.full_cycle ? "последний цикл" : "неполный интервал"}:
+              {" "}вход {result.flow_balance.inlet_volume_ml.toFixed(3)} мл ·
+              выходы {result.flow_balance.outlet_volume_ml.toFixed(3)} мл.</p>
+            <p>Отсчёты с обратным потоком: вход {result.flow_balance.reverse_samples.inlet},
+              {" "}ICA {result.flow_balance.reverse_samples.ica}, ECA {result.flow_balance.reverse_samples.eca}.
+              Ограничение давления сработало на {result.flow_balance.pressure_clamped_steps} шагах.</p>
+          </section> : <p>Записанных данных для проверки баланса потока нет.</p>}
           <select
             aria-label="Показатель CFD"
             value={field}

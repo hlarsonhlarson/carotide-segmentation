@@ -29,27 +29,24 @@ import SimpleITK as sitk
 
 
 def _slice_sort_key(ds):
-    """Spatial order, not filename order. VERIFIED this was a real bug on
-    real data: files were previously appended in `sorted(path.rglob("*"))`
-    (alphabetical by filename) order and handed straight to
-    ImageSeriesReader.SetFileNames, which trusts the given order instead of
-    re-sorting — unlike GetGDCMSeriesFileNames, which does sort spatially,
-    but only works on a whole directory, not an arbitrary file list grouped
-    by series UID the way this project needs (a real study folder mixes
-    many series flat in one directory). One real patient's filenames
-    happened to be alphabetically consistent with InstanceNumber, masking
-    this; nothing guarantees that in general, and the symptom otherwise is
-    exactly "slices jump around non-sequentially" when scrolling — prefer
-    InstanceNumber (what actually defines acquisition order), falling back
-    to the slice-normal position, then filename, for the rare file missing
-    both.
+    """Sort by patient-space slice-normal position, including oblique scans.
+
+    InstanceNumber is an acquisition identifier, not a geometric coordinate.
+    Use it only when spatial metadata is unavailable.
     """
+    position = getattr(ds, "ImagePositionPatient", None)
+    orientation = getattr(ds, "ImageOrientationPatient", None)
+    if position is not None and orientation is not None:
+        position = np.asarray(position, dtype=float)
+        orientation = np.asarray(orientation, dtype=float)
+        if position.shape == (3,) and orientation.shape == (6,):
+            normal = np.cross(orientation[:3], orientation[3:])
+            length = np.linalg.norm(normal)
+            if np.isfinite(position).all() and np.isfinite(length) and length > 1e-8:
+                return (0, float(np.dot(position, normal / length)))
     instance_number = getattr(ds, "InstanceNumber", None)
     if instance_number is not None:
-        return (0, int(instance_number))
-    position = getattr(ds, "ImagePositionPatient", None)
-    if position is not None:
-        return (1, float(position[2]))
+        return (1, int(instance_number))
     return (2, str(getattr(ds, "filename", "")))
 
 
@@ -103,15 +100,118 @@ def list_series(path_str: str):
     return out
 
 
+def _validate_stack_geometry(headers):
+    """Reject stacks that cannot be represented by one regular orthogonal grid.
+
+    DICOM decimal-string rounding is allowed (0.01 mm or 1% of slice step).
+    Tilted/sheared stacks require resampling, not silently averaged spacing.
+    """
+    if len(headers) < 2:
+        return
+    positions, orientations, spacings, sizes = [], [], [], []
+    for ds in headers:
+        if int(getattr(ds, "NumberOfFrames", 1)) != 1:
+            raise ValueError("Multiple multi-frame DICOM files are not a supported volume")
+        try:
+            position = np.asarray(ds.ImagePositionPatient, dtype=float)
+            orientation = np.asarray(ds.ImageOrientationPatient, dtype=float)
+            spacing = np.asarray(ds.PixelSpacing, dtype=float)
+            size = (int(ds.Rows), int(ds.Columns))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("DICOM stack is missing spatial geometry metadata") from exc
+        if (position.shape != (3,) or orientation.shape != (6,) or spacing.shape != (2,)
+                or not all(np.isfinite(a).all() for a in (position, orientation, spacing))
+                or np.any(spacing <= 0) or min(size) <= 0):
+            raise ValueError("Invalid DICOM spatial geometry")
+        basis = orientation.reshape(2, 3)
+        if not np.allclose(basis @ basis.T, np.eye(2), atol=1e-4, rtol=0):
+            raise ValueError("DICOM orientation must have orthonormal direction cosines")
+        positions.append(position)
+        orientations.append(orientation)
+        spacings.append(spacing)
+        sizes.append(size)
+    if not np.allclose(orientations, orientations[0], atol=1e-4, rtol=0):
+        raise ValueError("DICOM series mixes slice orientations; choose a consistent stack")
+    if len(set(sizes)) != 1 or not np.allclose(spacings, spacings[0], atol=1e-5, rtol=1e-4):
+        raise ValueError("DICOM series mixes image dimensions or pixel spacings")
+    normal = np.cross(orientations[0][:3], orientations[0][3:])
+    normal /= np.linalg.norm(normal)
+    positions = np.asarray(positions)
+    projected = positions @ normal
+    order = np.argsort(projected)
+    steps = np.diff(projected[order])
+    if np.any(steps <= 1e-3):
+        raise ValueError("DICOM series contains duplicate slice positions")
+    step = float(np.median(steps))
+    tolerance = max(.01, .01 * step)
+    if np.any(abs(steps - step) > tolerance):
+        raise ValueError("DICOM slice spacing is nonuniform or slices are missing")
+    # Per-step checks alone permit accumulated drift; check the entire grid.
+    expected = positions[order[0]] + np.arange(len(headers))[:, None] * step * normal
+    if np.max(np.linalg.norm(positions[order] - expected, axis=1)) > tolerance:
+        raise ValueError("DICOM positions form a tilted, sheared or irregular grid; resampling is required")
+    if not (np.all(np.diff(projected) > 0) or np.all(np.diff(projected) < 0)):
+        raise ValueError("DICOM slices are not in spatial order")
+
+
+def _validate_multiframe_geometry(ds):
+    """Validate enhanced DICOM functional groups before ITK flattens them."""
+    count = int(getattr(ds, "NumberOfFrames", 1))
+    if count <= 1:
+        return
+    frames = getattr(ds, "PerFrameFunctionalGroupsSequence", [])
+    shared = getattr(ds, "SharedFunctionalGroupsSequence", [])
+    if len(frames) != count:
+        raise ValueError("Multi-frame DICOM requires per-frame spatial geometry")
+
+    def value(frame, sequence, attribute):
+        for group in (frame, *shared):
+            items = getattr(group, sequence, [])
+            if items and hasattr(items[0], attribute):
+                return getattr(items[0], attribute)
+        raise ValueError(f"Multi-frame DICOM is missing {attribute}")
+
+    headers = []
+    for frame in frames:
+        header = pydicom.dataset.Dataset()
+        header.Rows, header.Columns = ds.Rows, ds.Columns
+        header.ImagePositionPatient = value(frame, "PlanePositionSequence", "ImagePositionPatient")
+        header.ImageOrientationPatient = value(frame, "PlaneOrientationSequence", "ImageOrientationPatient")
+        header.PixelSpacing = value(frame, "PixelMeasuresSequence", "PixelSpacing")
+        headers.append(header)
+    _validate_stack_geometry(headers)
+
+
 def _read_image(files: list[str]):
     if len(files) > 1:
+        _validate_stack_geometry([pydicom.dcmread(f, stop_before_pixels=True) for f in files])
         reader = sitk.ImageSeriesReader()
         reader.SetFileNames(files)
         return reader.Execute()
+    _validate_multiframe_geometry(pydicom.dcmread(files[0], stop_before_pixels=True))
     return sitk.ReadImage(files[0])
 
 
-def load_series(path_str: str, series_uid: str | None = None):
+def display_flips(direction):
+    """Correct acquisition-axis reversals without changing stored voxel indices.
+
+    ITK direction is row-major XYZ in patient LPS. PNG coronal/sagittal
+    rows already reverse voxel Z; that assumes Z increases superiorly.
+    Flip the display when an acquisition axis has the opposite direction.
+    This does not resample oblique acquisitions into anatomical planes.
+    """
+    matrix = np.asarray(direction).reshape(3, 3)
+    reversed_axes = [bool(matrix[i, i] < 0) for i in range(3)]
+    x, y, z = reversed_axes
+    return {
+        "axial": {"x": x, "y": y},
+        "coronal": {"x": x, "y": z},
+        "sagittal": {"x": y, "y": z},
+    }
+
+
+def load_series(path_str: str, series_uid: str | None = None, *, include_display_flips=False,
+                include_geometry=False):
     """Returns (array, spacing_mm, origin_mm, modality) for one series in the
     DICOM study at `path_str` (a folder). array axis order is (z, y, x),
     matching SimpleITK's GetArrayFromImage convention used throughout this
@@ -141,11 +241,23 @@ def load_series(path_str: str, series_uid: str | None = None):
     img = _read_image(chosen["files"])
 
     arr = sitk.GetArrayFromImage(img).astype(np.float32)
+    if img.GetDimension() != 3 or arr.ndim != 3:
+        raise ValueError("Select a three-dimensional scalar DICOM volume")
     spacing_mm = np.asarray(img.GetSpacing())[::-1]
     origin_mm = np.asarray(img.GetOrigin())[::-1]
+    direction = np.asarray(img.GetDirection()).reshape(3, 3)
+    if (not np.isfinite(spacing_mm).all() or np.any(spacing_mm <= 0)
+            or not np.isfinite(origin_mm).all()
+            or not np.allclose(direction.T @ direction, np.eye(3), atol=1e-4, rtol=0)):
+        raise ValueError("DICOM volume has invalid spacing, origin or direction")
     modality = chosen["modality"] or "MR"
 
-    return arr, spacing_mm, origin_mm, modality
+    result = (arr, spacing_mm, origin_mm, modality)
+    if include_display_flips:
+        result = (*result, display_flips(img.GetDirection()))
+    if include_geometry:
+        result = (*result, np.asarray(img.GetDirection()).reshape(3, 3))
+    return result
 
 
 def to_nifti_tempfile(array: np.ndarray, spacing_mm, origin_mm) -> Path:

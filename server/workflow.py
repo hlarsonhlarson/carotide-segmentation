@@ -23,8 +23,16 @@ def invalidate(case, side, stage='surface'):
     """Invalidate descendants, including persisted references and detached jobs."""
     if stage not in STAGES:
         raise ValueError(stage)
+    # An accepted automatic draft is tied to its exact paths and contours.
+    # Any source-geometry edit needs a fresh human acknowledgement; rebuilding
+    # only a mesh/CFD result does not.
+    if stage == 'surface' and case.autoseed_review.get('accepted'):
+        case.autoseed_review['accepted'] = False
+        if case.autoseed_job:
+            case.autoseed_job['review_accepted'] = False
     downstream = STAGES[STAGES.index(stage):]
     if 'surface' in downstream:
+        case.surface_cache.pop(side, None)
         case.built_surfaces.pop(side, None)
         case.revisions[side]['geometry'] += 1
     if 'mesh' in downstream:

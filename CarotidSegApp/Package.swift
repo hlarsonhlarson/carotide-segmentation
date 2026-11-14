@@ -8,6 +8,7 @@ let package = Package(
         .executableTarget(
             name: "CarotidSegApp",
             path: "Sources/CarotidSegApp"
-        )
+        ),
+        .testTarget(name: "CarotidSegAppTests", dependencies: ["CarotidSegApp"])
     ]
 )

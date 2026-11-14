@@ -22,6 +22,7 @@ process) — pysu2's CDriver and MPI both own real global state that
 doesn't belong inside a long-lived web server.
 """
 import json
+import csv
 import os
 import sys
 import time
@@ -31,6 +32,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cca_waveform import inlet_velocity_ms, mean_velocity_ms  # noqa: E402
 from windkessel import Windkessel, calibrate_two_outlet_rcr  # noqa: E402
+from cfd_balance import flow_metrics  # noqa: E402
 
 COUPLING_RELAXATION = 0.03  # was 0.1 — see the real divergence this under-relaxes further against, below
 # Explicit (one-step-behind) Windkessel<->CFD coupling, by construction:
@@ -69,7 +71,11 @@ def marker_area_and_flow(driver, marker_id, vel_idx, comm):
             i_point = driver.GetMarkerNode(marker_id, iv)
             if not driver.GetNodeDomain(i_point):
                 continue
-            normal = driver.GetMarkerVertexNormals(marker_id, iv, False)
+            # SU2 geometry stores inward boundary normals. Its own boundary
+            # solvers negate GetNormal() before computing outward fluxes.
+            # Verified against the installed CDriverBase and a straight duct:
+            # inlet normal is +X, outlet normals are -X.
+            normal = -np.asarray(driver.GetMarkerVertexNormals(marker_id, iv, False), dtype=float)
             a = float(np.linalg.norm(normal))
             area += a
             vel = [prims(iv, vel_idx[d]) for d in range(len(vel_idx))]
@@ -109,6 +115,8 @@ def main():
     id_cca = marker_ids.get("cca_inlet", -1)
     id_ica = marker_ids.get("ica_outlet", -1)
     id_eca = marker_ids.get("eca_outlet", -1)
+    if min(id_cca, id_ica, id_eca) < 0:
+        raise ValueError("The pulsatile runner requires CCA inlet and ICA/ECA outlet markers")
 
     prim_idx = driver.GetPrimitiveIndices()
     vel_idx = [prim_idx["VELOCITY_X"], prim_idx["VELOCITY_Y"], prim_idx["VELOCITY_Z"]]
@@ -132,12 +140,22 @@ def main():
             q_ica_mlps=q_ica_mean * 1e6, q_eca_mlps=q_eca_mean * 1e6,
             p_ica_mmhg=ica_map_pa / 133.322, p_eca_mmhg=eca_map_pa / 133.322,
             inlet_area_mm2=inlet_area * 1e6,
+            flux_convention="outward_su2_normals_v2",
+            flux_method="nodal_boundary_velocity_quadrature",
         )
 
     n_cca = driver.GetNumberMarkerNodes(id_cca) if id_cca >= 0 else 0
     p_ica_applied = ica_map_pa
     p_eca_applied = eca_map_pa
     t_start = time.time()
+    flow_file = open("boundary_flows.csv", "w", newline="") if is_root else None
+    flow_writer = csv.DictWriter(flow_file, fieldnames=[
+        "step", "time_s", "q_inlet_mlps", "q_ica_mlps", "q_eca_mlps",
+        "mass_imbalance_mlps", "mass_imbalance_relative", "inlet_reversed",
+        "ica_reversed", "eca_reversed", "ica_pressure_clamped", "eca_pressure_clamped",
+    ]) if is_root else None
+    if flow_writer:
+        flow_writer.writeheader()
 
     for time_iter in range(total_steps):
         t = time_iter * dt
@@ -153,6 +171,8 @@ def main():
         p_eca_raw = wk_eca.step(dt, q_eca)
         p_ica_applied += COUPLING_RELAXATION * (p_ica_raw - p_ica_applied)
         p_eca_applied += COUPLING_RELAXATION * (p_eca_raw - p_eca_applied)
+        ica_clamped = not P_APPLIED_MIN_PA <= p_ica_applied <= P_APPLIED_MAX_PA
+        eca_clamped = not P_APPLIED_MIN_PA <= p_eca_applied <= P_APPLIED_MAX_PA
         p_ica_applied = min(max(p_ica_applied, P_APPLIED_MIN_PA), P_APPLIED_MAX_PA)
         p_eca_applied = min(max(p_eca_applied, P_APPLIED_MIN_PA), P_APPLIED_MAX_PA)
         # Clamping only the *applied* pressure would still let the
@@ -176,16 +196,29 @@ def main():
         driver.Monitor(time_iter)
         driver.Output(time_iter)
 
+        # Diagnostics must use the same solved state for all three boundaries.
+        # The q values above are deliberately lagged inputs to the RCR model.
+        _, inlet_outward = marker_area_and_flow(driver, id_cca, vel_idx, comm)
+        _, ica_outward = marker_area_and_flow(driver, id_ica, vel_idx, comm)
+        _, eca_outward = marker_area_and_flow(driver, id_eca, vel_idx, comm)
+        balance = flow_metrics(inlet_outward, ica_outward, eca_outward)
         if is_root:
+            flow_writer.writerow({
+                "step": time_iter + 1, "time_s": t, **balance,
+                "ica_pressure_clamped": int(ica_clamped), "eca_pressure_clamped": int(eca_clamped),
+            })
+            flow_file.flush()
             _progress(
                 "SU2PROGRESS", step=time_iter + 1, total_steps=int(total_steps),
                 t_sim=t, cycle_s=cycle_s, elapsed_s=time.time() - t_start,
-                v_cca_cms=v_mag * 100, q_ica_mlps=q_ica * 1e6, q_eca_mlps=q_eca * 1e6,
+                v_cca_cms=v_mag * 100, **balance,
+                ica_pressure_clamped=ica_clamped, eca_pressure_clamped=eca_clamped,
                 p_ica_mmhg=p_ica_applied / 133.322, p_eca_mmhg=p_eca_applied / 133.322,
             )
 
     driver.Finalize()
     if is_root:
+        flow_file.close()
         _progress("SU2DONE", total_steps=int(total_steps), elapsed_s=time.time() - t_start)
 
 
