@@ -4,6 +4,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import {
   labelVesselSegments,
   scenePoint,
+  sectionPixelToMm,
   vesselSegmentNames,
   vesselSegments,
   wallGeometry,
@@ -23,6 +24,11 @@ export const segmentColors: Record<VesselSegment, string> = {
   ica: branchColors.cca_ica,
   eca: branchColors.cca_eca,
 };
+type PlaqueKind = "calcified" | "lipid";
+const plaqueKinds: PlaqueKind[] = ["calcified", "lipid"];
+// White calcium stands out against the red ICA wall.
+const plaqueColors: Record<PlaqueKind, string> = { calcified: "#ffffff", lipid: "#ffd54f" };
+const plaqueNames: Record<PlaqueKind, string> = { calcified: "Кальций", lipid: "Атерома" };
 const zero = [0, 0, 0];
 type Runtime = {
   group: THREE.Group;
@@ -36,7 +42,7 @@ type Runtime = {
 };
 function clear(group: THREE.Group) {
   group.traverse((obj) => {
-    if (obj instanceof THREE.Mesh || obj instanceof THREE.Line) {
+    if (obj instanceof THREE.Mesh || obj instanceof THREE.Line || obj instanceof THREE.Points) {
       obj.geometry.dispose();
       const materials = Array.isArray(obj.material)
         ? obj.material
@@ -69,6 +75,8 @@ export function PathPreview({
   const [visible, setVisible] = useState<Record<VesselSegment, boolean>>(
     { cca: true, bifurcation: true, ica: true, eca: true });
   const [bifurcationMm, setBifurcationMm] = useState(10);
+  const [plaqueVisible, setPlaqueVisible] = useState<Record<PlaqueKind, boolean>>(
+    { calcified: true, lipid: true });
   // O(sections²) distance checks: recompute only when the series change,
   // not on every render.
   const labels = useMemo(
@@ -77,6 +85,12 @@ export function PathPreview({
     [segmentations, bifurcationMm],
   );
   const visibleKey = vesselSegments.filter((segment) => visible[segment]).join(",");
+  // Sections whose plaque composition can be placed in 3D (needs the frame
+  // stored with wall analyses since this version).
+  const plaqueSections = branches.reduce((n, b) =>
+    n + (segmentations[b] || []).filter((p, i) =>
+      p.wall_analysis?.composition && p.wall_analysis.section_frame &&
+      i >= (b === "cca_eca" ? labels.shared.cca_eca : 0)).length, 0);
   const sectionCounts = vesselSegments.map(segment =>
     branches.reduce((n, b) => n + (labels[b as "cca_ica" | "cca_eca"] || [])
       .filter((label, i) => label === segment &&
@@ -284,6 +298,31 @@ export function PathPreview({
           );
         else wall.geometry.dispose();
       }
+      // Plaque components as points at their pixel positions in each section.
+      const clouds: Record<PlaqueKind, number[]> = { calcified: [], lipid: [] };
+      series.forEach((section, i) => {
+        const wallResult = section.wall_analysis;
+        const frame = wallResult?.section_frame, composition = wallResult?.composition;
+        if (i < skip || !frame || !composition || !visible[branchLabels[i]]) return;
+        for (const kind of plaqueKinds) {
+          if (!plaqueVisible[kind]) continue;
+          const pixels = kind === "calcified" ? composition.calcified_pixels : composition.lipid_pixels;
+          for (const pixel of pixels) {
+            const q = world(sectionPixelToMm(pixel, frame));
+            clouds[kind].push(q.x, q.y, q.z);
+          }
+        }
+      });
+      for (const kind of plaqueKinds) {
+        if (!clouds[kind].length) continue;
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.Float32BufferAttribute(clouds[kind], 3));
+        view.group.add(new THREE.Points(geometry, new THREE.PointsMaterial({
+          color: plaqueColors[kind], size: 0.45, sizeAttenuation: true,
+          // Plaque lies inside the translucent wall; draw it on top.
+          depthTest: false,
+        })));
+      }
     }
     view.updateClipping();
     if (
@@ -312,6 +351,8 @@ export function PathPreview({
     contourCount,
     visible,
     bifurcationMm,
+    plaqueVisible,
+    labels,
   ]);
 
   return (
@@ -350,6 +391,19 @@ export function PathPreview({
             <i style={{ background: segmentColors[segment] }} />
             {vesselSegmentNames[segment] === "Бифуркация" ? "Бифурк." : vesselSegmentNames[segment]}
             <b>{sectionCounts[i]}</b>
+          </button>
+        ))}
+        {plaqueSections > 0 && plaqueKinds.map((kind) => (
+          <button
+            key={kind}
+            type="button"
+            className="segment-chip"
+            aria-pressed={plaqueVisible[kind]}
+            title={`${plaqueVisible[kind] ? "Скрыть" : "Показать"}: ${plaqueNames[kind]} (по ${plaqueSections} сечениям со стенкой)`}
+            onClick={() => setPlaqueVisible({ ...plaqueVisible, [kind]: !plaqueVisible[kind] })}
+          >
+            <i className="plaque-dot" style={{ background: plaqueColors[kind] }} />
+            {plaqueNames[kind]}
           </button>
         ))}
         {labels.split ? (

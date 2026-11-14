@@ -41,6 +41,7 @@ export function Segmentation({
   focusIndex = null,
   onSeriesChange,
   onError,
+  otherPoints = [],
 }: {
   base: string;
   side: string;
@@ -49,6 +50,8 @@ export function Segmentation({
   focusIndex?: number | null;
   onSeriesChange: SegmentationChange;
   onError: (message: string) => void;
+  // The other branch of this side, used to locate CCA / bifurcation ranges.
+  otherPoints?: SegmentationPoint[];
 }) {
   const latestPoints = useRef<SegmentationPoint[]>([]);
   const [points, setPoints] = useState<SegmentationPoint[]>([]);
@@ -546,7 +549,7 @@ export function Segmentation({
               </p>}
             </section>}
             <LongitudinalProfile route={route} points={points} index={index}
-              onSelect={goTo} disabled={busy} />
+              onSelect={goTo} disabled={busy} branch={branch} otherPoints={otherPoints} />
           </>
         )}
       </div>

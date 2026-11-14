@@ -1,5 +1,12 @@
 import * as THREE from "three";
 
+export type SectionFrame = { origin_mm: number[]; u: number[]; v: number[]; px_mm: number };
+
+// Section pixel [row, col] to world mm (same mapping as the backend contours).
+export function sectionPixelToMm([row, col]: number[], f: SectionFrame) {
+  return f.origin_mm.map((o, k) => o + col * f.px_mm * f.u[k] + row * f.px_mm * f.v[k]);
+}
+
 export type PlaqueComposition = {
   plaque_area_mm2: number;
   calcified_area_mm2: number;
@@ -32,6 +39,7 @@ export type SegmentationPoint = {
     status: "proposal" | "manual";
     parameters: { calcium_hu: number };
     composition?: PlaqueComposition;
+    section_frame?: SectionFrame;
   };
 };
 export type DisplayFlips = Record<string, { x: boolean; y: boolean }>;

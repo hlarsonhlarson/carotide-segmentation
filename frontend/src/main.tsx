@@ -405,6 +405,8 @@ function App() {
                   focusIndex={reviewTarget?.side === side && reviewTarget?.branch === branch ? reviewTarget.index : null}
                   onSeriesChange={updateSegmentation}
                   onError={setError}
+                  otherPoints={segmentations[segmentationKey(base, side,
+                    branch === "cca_ica" ? "cca_eca" : "cca_ica")] || []}
                 />
               )}
               {(step === 2 || step === 3) && (

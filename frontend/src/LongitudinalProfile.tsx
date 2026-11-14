@@ -1,6 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { request } from "./Segmentation";
-import type { SegmentationPoint } from "./segmentationGeometry";
+import {
+  labelVesselSegments,
+  vesselSegmentNames,
+  vesselSegments,
+  type SegmentationPoint,
+  type VesselSegment,
+} from "./segmentationGeometry";
 
 type Section = {
   index: number; distance_mm: number;
@@ -34,9 +40,10 @@ const reasons: Record<string, string> = {
   different_density_parameters: "Разные или неизвестные параметры высокой плотности",
 };
 
-export function LongitudinalProfile({ route, points, index, onSelect, disabled }: {
+export function LongitudinalProfile({ route, points, index, onSelect, disabled, branch, otherPoints = [] }: {
   route: string; points: SegmentationPoint[]; index: number;
   onSelect: (index: number) => void; disabled: boolean;
+  branch?: string; otherPoints?: SegmentationPoint[];
 }) {
   const [start, setStart] = useState(0);
   const [end, setEnd] = useState(points.length - 1);
@@ -45,6 +52,19 @@ export function LongitudinalProfile({ route, points, index, onSelect, disabled }
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => { setStart(0); setEnd(points.length - 1); }, [route, points.length]);
+  // Index ranges of CCA / bifurcation / distal artery along this branch, so
+  // lumen and plaque volumes can be read per vessel part.
+  const segmentRanges = useMemo(() => {
+    if (!branch || !otherPoints.length) return [];
+    const isIca = branch === "cca_ica";
+    const labels = labelVesselSegments(isIca ? points : otherPoints, isIca ? otherPoints : points);
+    if (!labels.split) return [];
+    const own = isIca ? labels.cca_ica : labels.cca_eca;
+    return vesselSegments.flatMap((segment: VesselSegment) => {
+      const indices = own.flatMap((label, i) => (label === segment ? [i] : []));
+      return indices.length ? [{ segment, start: indices[0], end: indices[indices.length - 1] }] : [];
+    });
+  }, [branch, points, otherPoints]);
   useEffect(() => {
     let active = true;
     setProfile(null);
@@ -68,6 +88,15 @@ export function LongitudinalProfile({ route, points, index, onSelect, disabled }
   const y = (s: Section) => 145 - 120 * (s.lumen?.area_mm2 || 0) / maxArea;
   return <section aria-label="Профиль вдоль сосуда">
     <h3>Профиль просвета и оценка объёмов</h3>
+    {!!segmentRanges.length && <div className="button-row" role="group" aria-label="Диапазон по отделу">
+      {segmentRanges.map(r => <button key={r.segment} disabled={disabled}
+        aria-pressed={start === r.start && end === r.end}
+        onClick={() => { setStart(r.start); setEnd(r.end); }}>
+        {vesselSegmentNames[r.segment]} ({r.start + 1}–{r.end + 1})
+      </button>)}
+      <button disabled={disabled} aria-pressed={start === 0 && end === points.length - 1}
+        onClick={() => { setStart(0); setEnd(points.length - 1); }}>Весь путь</button>
+    </div>}
     <label>Начальное сечение
       <input type="number" min={1} max={points.length} value={start + 1} disabled={disabled}
         onChange={e => setStart(Math.max(0, Math.min(points.length - 1, +e.target.value - 1)))} />
