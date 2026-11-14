@@ -62,6 +62,13 @@ def snapshot(case):
     }
 
 
+def _manifest_json(data) -> bytes:
+    # indent= forces json's pure-Python encoder; compact output uses the C
+    # encoder and is several times faster on multi-MB manifests. Autosave
+    # runs after every edit, so this is on the interactive path.
+    return json.dumps(data, allow_nan=False, separators=(',', ':')).encode()
+
+
 def autosave(case):
     if case.project_dir:
         folder = Path(case.project_dir)
@@ -69,7 +76,7 @@ def autosave(case):
         if current.get('project_id') != case.project_id:
             raise HTTPException(409, 'project ownership changed; reopen the project')
         try:
-            atomic_write(folder / 'project.json', json.dumps(snapshot(case), allow_nan=False, indent=2).encode())
+            atomic_write(folder / 'project.json', _manifest_json(snapshot(case)))
         except OSError as e:
             raise HTTPException(507, f'Autosave failed; edits remain in memory. Save again before closing: {e}') from e
 
@@ -134,7 +141,7 @@ def set_project_dir(case_id: str, req: ProjectRequest):
         raise HTTPException(409, 'Project already has a folder; copy the closed project folder to move it.')
     case.project_dir = str(folder)
     try:
-        atomic_write(manifest, json.dumps(snapshot(case), allow_nan=False, indent=2).encode())
+        atomic_write(manifest, _manifest_json(snapshot(case)))
     except Exception:
         case.project_dir = old
         raise

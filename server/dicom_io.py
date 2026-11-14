@@ -72,11 +72,12 @@ def _group_series(path: Path) -> dict:
                 "modality": str(getattr(ds, "Modality", "") or "").strip(),
                 "files": [],
             }
-        groups[uid]["files"].append((_slice_sort_key(ds), str(f)))
+        groups[uid]["files"].append((_slice_sort_key(ds), str(f), ds))
 
     for g in groups.values():
         g["files"].sort(key=lambda item: item[0])
-        g["files"] = [f for _, f in g["files"]]
+        g["headers"] = [ds for _, _, ds in g["files"]]
+        g["files"] = [f for _, f, _ in g["files"]]
     return groups
 
 
@@ -182,13 +183,17 @@ def _validate_multiframe_geometry(ds):
     _validate_stack_geometry(headers)
 
 
-def _read_image(files: list[str]):
+def _read_image(files: list[str], headers=None):
+    """``headers`` are the already-parsed headers of ``files`` (same order),
+    when the caller has them; otherwise each file is read again."""
+    if headers is None or len(headers) != len(files):
+        headers = None
     if len(files) > 1:
-        _validate_stack_geometry([pydicom.dcmread(f, stop_before_pixels=True) for f in files])
+        _validate_stack_geometry(headers or [pydicom.dcmread(f, stop_before_pixels=True) for f in files])
         reader = sitk.ImageSeriesReader()
         reader.SetFileNames(files)
         return reader.Execute()
-    _validate_multiframe_geometry(pydicom.dcmread(files[0], stop_before_pixels=True))
+    _validate_multiframe_geometry(headers[0] if headers else pydicom.dcmread(files[0], stop_before_pixels=True))
     return sitk.ReadImage(files[0])
 
 
@@ -238,7 +243,7 @@ def load_series(path_str: str, series_uid: str | None = None, *, include_display
     else:
         chosen = max(groups.values(), key=lambda g: len(g["files"]))
 
-    img = _read_image(chosen["files"])
+    img = _read_image(chosen["files"], headers=chosen.get("headers"))
 
     arr = sitk.GetArrayFromImage(img).astype(np.float32)
     if img.GetDimension() != 3 or arr.ndim != 3:

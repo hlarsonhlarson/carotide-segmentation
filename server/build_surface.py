@@ -212,16 +212,23 @@ def _local_open_end(poly, cut_point_mm, cut_tangent_mm, bound_radius_mm, at_star
         return poly
 
     polys = poly.GetPolys()
-    polys.InitTraversal()
-    id_list = vtk.vtkIdList()
+    offsets = numpy_support.vtk_to_numpy(polys.GetOffsetsArray()).astype(np.int64)
+    connectivity = numpy_support.vtk_to_numpy(polys.GetConnectivityArray()).astype(np.int64)
+    # A cell is dropped when any of its points is removed (same rule as the
+    # per-cell loop this replaces, done with one reduceat over the flat ids).
+    sizes = np.diff(offsets)
+    drop = np.zeros(len(sizes), dtype=bool)
+    nonempty = sizes > 0
+    if nonempty.any():
+        drop[nonempty] = np.logical_or.reduceat(remove_point[connectivity], offsets[:-1][nonempty])
+    keep_ids = np.repeat(~drop, sizes)
+    keep_sizes = sizes[~drop]
+    new_offsets = np.concatenate([[0], np.cumsum(keep_sizes)]).astype(np.int64)
     new_polys = vtk.vtkCellArray()
-    while polys.GetNextCell(id_list):
-        ids = [id_list.GetId(k) for k in range(id_list.GetNumberOfIds())]
-        if any(remove_point[i] for i in ids):
-            continue
-        new_polys.InsertNextCell(len(ids))
-        for i in ids:
-            new_polys.InsertCellPoint(i)
+    new_polys.SetData(
+        numpy_support.numpy_to_vtk(new_offsets, deep=True, array_type=vtk.VTK_ID_TYPE),
+        numpy_support.numpy_to_vtk(connectivity[keep_ids], deep=True, array_type=vtk.VTK_ID_TYPE),
+    )
 
     result = vtk.vtkPolyData()
     result.SetPoints(poly.GetPoints())
@@ -444,10 +451,19 @@ def _stamp_contour(mask, crop_origin_mm, spacing_mm, center_mm, tangent_mm, cont
     delta = world - center
     along = delta @ t
     within_thickness = np.abs(along) <= half_thickness_mm
-    pu = delta @ u
-    pv = delta @ v
-    inside_poly = _points_in_polygon_2d(pu, pv, poly_u, poly_v)
-    mask[lo_vox[0]:hi_vox[0], lo_vox[1]:hi_vox[1], lo_vox[2]:hi_vox[2]] |= (within_thickness & inside_poly)
+    # The thin slab is a small fraction of the bounding box; test only its
+    # voxels (and only those inside the polygon's own u/v extent) instead of
+    # running the per-edge ray cast over the whole box.
+    candidates = np.flatnonzero(within_thickness)
+    flat_delta = delta.reshape(-1, 3)[candidates]
+    pu = flat_delta @ u
+    pv = flat_delta @ v
+    in_box = ((pu >= poly_u.min()) & (pu <= poly_u.max())
+              & (pv >= poly_v.min()) & (pv <= poly_v.max()))
+    candidates, pu, pv = candidates[in_box], pu[in_box], pv[in_box]
+    stamp = np.zeros(within_thickness.size, dtype=bool)
+    stamp[candidates] = _points_in_polygon_2d(pu, pv, poly_u, poly_v)
+    mask[lo_vox[0]:hi_vox[0], lo_vox[1]:hi_vox[1], lo_vox[2]:hi_vox[2]] |= stamp.reshape(within_thickness.shape)
     return True
 
 

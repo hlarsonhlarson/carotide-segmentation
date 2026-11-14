@@ -22,7 +22,7 @@ def test_descending_stack_preserves_pixels_and_voxel_geometry(tmp_path, monkeypa
     image.SetSpacing((0.5, 0.75, 2.))
     image.SetOrigin((10., 20., 30.))
     monkeypatch.setattr(dicom_io, '_group_series', lambda path: {'test': {'files': ['test'], 'modality': 'CT'}})
-    monkeypatch.setattr(dicom_io, '_read_image', lambda files: image)
+    monkeypatch.setattr(dicom_io, '_read_image', lambda files, headers=None: image)
     loaded, spacing, origin, modality, flips = dicom_io.load_series(str(tmp_path), 'test', include_display_flips=True)
     np.testing.assert_array_equal(loaded, array)
     np.testing.assert_array_equal(spacing, [2., 0.75, 0.5])
