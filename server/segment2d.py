@@ -13,7 +13,7 @@ import math
 
 import numpy as np
 from scipy import ndimage as ndi
-from skimage import measure, segmentation
+from skimage import feature, measure, segmentation
 
 CENTER_SAMPLE_RADIUS_PX = 2
 # A contrast-opacified lumen vs. the muscle/fat/air around it is a huge,
@@ -91,8 +91,97 @@ def threshold_contour(slice_2d: np.ndarray, center_px, modality: str, max_radius
     dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
     binary = binary & (dist <= max_radius_px)
 
+    binary = _cut_thin_bridges(binary, (cy, cx))
+    binary = _split_at_waist(binary, (cy, cx))
     contour = _center_contour(binary, (cy, cx))
     return contour  # list of [row, col] float pixel coords, or None
+
+
+# A neighbouring bright vessel (jugular, ECA branch, small vein) often touches
+# the lumen through a partial-volume bridge only a few pixels wide; plain
+# connected-component growth then swallows it. Necks narrower than this
+# fraction of the lumen's inscribed diameter are cut.
+BRIDGE_CUT_FRACTION = 0.7
+BRIDGE_CENTER_SEARCH_PX = 3
+
+
+def _disk(radius: int) -> np.ndarray:
+    yy, xx = np.mgrid[-radius:radius + 1, -radius:radius + 1]
+    return (yy ** 2 + xx ** 2) <= radius ** 2
+
+
+def _cut_thin_bridges(binary: np.ndarray, center_px):
+    """Keep the centre component without appendages joined by a thin neck.
+
+    Opening with a disk of half the lumen's inscribed radius removes necks
+    narrower than that disk; the surviving core is grown back by the same
+    disk inside the original mask, so the lumen's own outline is preserved.
+    """
+    cy, cx = center_px
+    labeled, _ = ndi.label(binary, structure=np.ones((3, 3)))
+    label_id = labeled[cy, cx]
+    if label_id == 0:
+        return binary
+    component = labeled == label_id
+    edt = ndi.distance_transform_edt(component)
+    r = BRIDGE_CENTER_SEARCH_PX
+    window = edt[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1]
+    radius = int(math.floor(float(window.max()) * BRIDGE_CUT_FRACTION))
+    if radius < 1:
+        return component
+    footprint = _disk(radius)
+    core = ndi.binary_opening(component, structure=footprint)
+    core_labels, _ = ndi.label(core, structure=np.ones((3, 3)))
+    near = core_labels[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1]
+    ids = near[near > 0]
+    if ids.size == 0:
+        return component
+    core = core_labels == np.bincount(ids).argmax()
+    return component & ndi.binary_dilation(core, structure=footprint)
+
+
+# Two touching vessels can share a contact wider than a "thin bridge". A
+# distance-transform watershed separates them at the waist; neighbouring
+# basins are merged back unless the waist is clearly narrower than both.
+WAIST_RATIO = 0.8
+WAIST_MIN_PEAK_DISTANCE_PX = 3
+
+
+def _split_at_waist(binary: np.ndarray, center_px):
+    cy, cx = center_px
+    labeled, _ = ndi.label(binary, structure=np.ones((3, 3)))
+    label_id = labeled[cy, cx]
+    if label_id == 0:
+        return binary
+    component = labeled == label_id
+    edt = ndi.distance_transform_edt(component)
+    peaks = feature.peak_local_max(edt, min_distance=WAIST_MIN_PEAK_DISTANCE_PX,
+                                   labels=component.astype(np.int32), exclude_border=False)
+    if len(peaks) < 2:
+        return component
+    markers = np.zeros(edt.shape, dtype=np.int32)
+    markers[tuple(peaks.T)] = np.arange(1, len(peaks) + 1)
+    basins = segmentation.watershed(-edt, markers, mask=component)
+    peak_of = ndi.maximum(edt, basins, index=np.arange(1, len(peaks) + 1))
+    peak_of = dict(zip(range(1, len(peaks) + 1), peak_of))
+    keep = {int(basins[cy, cx])}
+    if 0 in keep:
+        return component
+    frontier = list(keep)
+    while frontier:
+        region = frontier.pop()
+        inside = basins == region
+        ring = ndi.binary_dilation(inside, structure=np.ones((3, 3))) & ~inside & component
+        for other in np.unique(basins[ring]):
+            other = int(other)
+            if other == 0 or other in keep:
+                continue
+            touching = ring & (basins == other)
+            waist = float(edt[touching].max())
+            if waist >= WAIST_RATIO * min(peak_of[region], peak_of[other]):
+                keep.add(other)
+                frontier.append(other)
+    return np.isin(basins, list(keep))
 
 
 def levelset_contour(slice_2d: np.ndarray, center_px, initial_radius_px: float,
