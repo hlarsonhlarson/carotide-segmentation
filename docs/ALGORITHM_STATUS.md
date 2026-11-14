@@ -86,8 +86,11 @@ establish accuracy on patient CTA.
     calibration, mass balance, mesh/time-step convergence and real-run periodic
     convergence remain unverified. The existing 0.5 skin-friction-to-WSS scale
     remains a project convention pending independent dimensional verification.
-    The deployed Docker backend currently lacks the native SU2/pysu2/MPI
-    configuration, so synthetic temporal/VTK checks are not a new CFD run.
+    The web interface can now proxy a native macOS API with verified
+    SU2/pysu2/MPI imports and custom-boundary methods. A four-step synthetic
+    duct run completed through the normal solver and postprocessing chain.
+    This establishes execution/output compatibility, not patient CFD accuracy
+    or periodic convergence. See `docs/NATIVE_CFD.md` for startup and rollback.
 11. Expert-reference Dice/HD95, observer repeatability and CFD sensitivity runs
     require reference segmentations and completed simulation experiments.
 

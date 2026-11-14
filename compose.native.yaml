@@ -1,0 +1,7 @@
+# Native macOS backend (SU2/pysu2) with the Docker web interface.
+# Start scripts/native_web_backend.py, then:
+# docker compose -f compose.yaml -f compose.native.yaml up -d frontend
+services:
+  frontend:
+    volumes:
+      - ./frontend/nginx.native.conf:/etc/nginx/conf.d/default.conf:ro

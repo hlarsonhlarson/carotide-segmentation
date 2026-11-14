@@ -36,7 +36,7 @@ def snapshot(case):
     affine[:3, 3] = case.origin_mm[::-1]
     return {
         'format_version': FORMAT_VERSION, 'project_id': case.project_id,
-        'source_path': case.source_path, 'series_uid': case.series_uid,
+        'source_path': storage.portable_path(case.source_path, 'dicom'), 'series_uid': case.series_uid,
         'geometry': {'shape': list(case.array.shape), 'spacing_mm': case.spacing_mm.tolist(),
                      'origin_mm': case.origin_mm.tolist(), 'coordinate_system': 'zyx-mm',
                      'direction_lps': case.direction_lps.tolist(),
