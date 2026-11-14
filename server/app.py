@@ -701,6 +701,10 @@ def propose_wall(case_id: str, side: str, branch: str, index: int, req: WallAnal
         (origin + c * RESLICE_PX_SPACING_MM * u + r * RESLICE_PX_SPACING_MM * v).tolist()
         for r, c in result["wall_contour_px"]
     ]
+    # Pixel [row, col] -> mm: origin + col*px*u + row*px*v. Lets clients place
+    # composition pixels in 3D without resampling the section again.
+    result["section_frame"] = {"origin_mm": np.asarray(origin).tolist(), "u": np.asarray(u).tolist(),
+                               "v": np.asarray(v).tolist(), "px_mm": RESLICE_PX_SPACING_MM}
     point["wall_analysis"] = result
     return result
 
@@ -791,8 +795,11 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
                 contour_px = segment2d.threshold_contour(slice_2d, center_px, case.modality, max_radius_px)
             else:
                 contour_px = segment2d.levelset_contour(slice_2d, center_px, radius_px, max_radius_px)
-            if contour_px is None or _contour_compactness(contour_px) < AUTO_SEED_COMPACTNESS_MIN:
-                contour_px = None
+            if contour_px is not None and _contour_compactness(contour_px) < AUTO_SEED_COMPACTNESS_MIN:
+                # A notch left by excluded wall calcium is not a failed
+                # detection; anything else irregular still is.
+                if not (case.modality == "CT" and segment2d.calcium_notch(slice_2d, contour_px)):
+                    contour_px = None
             effective_method = "threshold" if case.modality == "CT" else "levelset"
         else:
             radius_px = max(req.radius_mm, 1.0) / RESLICE_PX_SPACING_MM

@@ -110,3 +110,19 @@ def test_calcium_threshold_rises_above_bright_lumen():
     comp = measure_wall_section(image, lumen, wall, PX, 600)["composition"]
     assert comp["calcium_hu_effective"] == pytest.approx(910)
     assert comp["calcified_area_mm2"] == pytest.approx(calcium.sum() * PX**2, rel=.05)
+
+
+def test_low_attenuation_continuing_outside_the_wall_is_not_atheroma():
+    image, _, _ = _phantom()
+    lumen, wall = _rings()
+    r, c = np.indices(image.shape)
+    # A fat tongue (20 HU) crossing the wall contour from outside, as when the
+    # outer boundary overreaches into perivascular fat.
+    tongue = (np.abs(r - 80) < 6) & (c > 80 + int(3.3 / PX))
+    image[tongue] = 20.
+    comp = measure_wall_section(image, lumen, wall, PX, 600)["composition"]
+    assert comp["perivascular_low_hu_area_mm2"] > 1
+    # The tongue (which here also covers the phantom core) is not atheroma.
+    assert comp["lipid_area_mm2"] < 0.2
+    parts = comp["calcified_area_mm2"] + comp["lipid_area_mm2"] + comp["fibrous_area_mm2"]
+    assert parts == pytest.approx(comp["plaque_area_mm2"])

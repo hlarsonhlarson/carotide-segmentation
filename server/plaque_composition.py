@@ -13,6 +13,10 @@ wall (plus any calcium the lumen contour swallowed) is split by attenuation:
   ``fat_hu`` <= HU < ``lipid_hu``, components of at least
   ``min_component_mm2``, at least ``edge_margin_mm`` inside the outer wall
   so that partial volume with perivascular fat is not called lipid core.
+  A low-attenuation region that continues beyond the outer wall by more
+  than ``outside_continuity_mm2`` is surrounding tissue reached by an
+  overreaching wall contour (on real CTA: fat between carotid and trachea),
+  not a core enclosed by the wall, and is not called atheroma.
 - fibrous: the remaining wall/plaque pixels from ``lipid_hu`` up to
   ``fibrous_max_hu``.
 - between ``fibrous_max_hu`` and the calcium threshold: reported as contrast
@@ -28,7 +32,8 @@ import numpy as np
 from scipy import ndimage as ndi
 
 ALGORITHM_VERSION = "hu-composition-1"
-DEFAULTS = {"lipid_hu": 50.0, "fat_hu": -50.0, "fibrous_max_hu": 150.0, "edge_margin_mm": 0.5}
+DEFAULTS = {"lipid_hu": 50.0, "fat_hu": -50.0, "fibrous_max_hu": 150.0, "edge_margin_mm": 0.5,
+            "outside_continuity_mm2": 2.0}
 # Contrast lumen HU varies little within a section (p99 ~1.05x median on real
 # CTA); wall calcium is typically >= 1.5x. 1.3x separates them with margin.
 CALCIUM_OVER_LUMEN = 1.3
@@ -44,7 +49,8 @@ def _components(mask, min_pixels):
 
 def classify_plaque(image, lumen_mask, wall_mask, pixel_mm, calcium_hu, min_component_mm2,
                     lipid_hu=DEFAULTS["lipid_hu"], fat_hu=DEFAULTS["fat_hu"],
-                    fibrous_max_hu=DEFAULTS["fibrous_max_hu"], edge_margin_mm=DEFAULTS["edge_margin_mm"]):
+                    fibrous_max_hu=DEFAULTS["fibrous_max_hu"], edge_margin_mm=DEFAULTS["edge_margin_mm"],
+                    outside_continuity_mm2=DEFAULTS["outside_continuity_mm2"]):
     image = np.asarray(image, dtype=float)
     lumen_mask = np.asarray(lumen_mask, dtype=bool)
     wall_mask = np.asarray(wall_mask, dtype=bool)
@@ -72,14 +78,29 @@ def classify_plaque(image, lumen_mask, wall_mask, pixel_mm, calcium_hu, min_comp
     lipid_candidates = (annulus & ~calcified & (image >= fat_hu) & (image < lipid_hu)
                         & (depth_mm >= edge_margin_mm))
     lipid = _components(lipid_candidates, min_pixels)
+    # Reject low-attenuation components that are part of a larger
+    # low-attenuation region extending outside the wall contour.
+    low = image < lipid_hu
+    low_labels, _ = ndi.label(low, structure=np.ones((3, 3)))
+    outside_area = np.bincount(low_labels[~wall_mask].ravel(), minlength=low_labels.max() + 1) * pixel_area
+    outside_area[0] = 0
+    lipid_labels, n_lipid = ndi.label(lipid, structure=np.ones((3, 3)))
+    perivascular = np.zeros(lipid.shape, dtype=bool)
+    for k in range(1, n_lipid + 1):
+        component = lipid_labels == k
+        reach = np.unique(low_labels[component])
+        if outside_area[reach].max() > outside_continuity_mm2:
+            perivascular |= component
+    lipid &= ~perivascular
     excluded = annulus & ~calcified & (image < fat_hu)
     contrast = annulus & ~calcified & (image >= fibrous_max_hu)
-    fibrous = plaque & ~calcified & ~lipid & ~excluded & ~contrast
+    # Surrounding tissue inside an overreaching wall contour is not plaque.
+    fibrous = plaque & ~calcified & ~lipid & ~excluded & ~contrast & ~perivascular
 
     def area(mask):
         return float(mask.sum() * pixel_area)
 
-    plaque_area = area(plaque & ~excluded & ~contrast)
+    plaque_area = area(plaque & ~excluded & ~contrast & ~perivascular)
     def fraction(mask):
         return float(area(mask) / plaque_area) if plaque_area > 0 else None
 
@@ -89,6 +110,7 @@ def classify_plaque(image, lumen_mask, wall_mask, pixel_mm, calcium_hu, min_comp
         "lipid_area_mm2": area(lipid),
         "fibrous_area_mm2": area(fibrous),
         "excluded_low_hu_area_mm2": area(excluded),
+        "perivascular_low_hu_area_mm2": area(perivascular),
         "contrast_partial_volume_area_mm2": area(contrast),
         "calcium_in_lumen_area_mm2": area(calcium_in_lumen),
         "calcified_fraction": fraction(calcified),
@@ -100,7 +122,8 @@ def classify_plaque(image, lumen_mask, wall_mask, pixel_mm, calcium_hu, min_comp
         "lumen_reference_hu": lumen_reference,
         "calcium_hu_effective": effective_calcium,
         "parameters": {"calcium_hu": float(calcium_hu), "lipid_hu": float(lipid_hu), "fat_hu": float(fat_hu), "fibrous_max_hu": float(fibrous_max_hu),
-                       "min_component_mm2": float(min_component_mm2), "edge_margin_mm": float(edge_margin_mm)},
+                       "min_component_mm2": float(min_component_mm2), "edge_margin_mm": float(edge_margin_mm),
+                       "outside_continuity_mm2": float(outside_continuity_mm2)},
         "algorithm_version": ALGORITHM_VERSION,
         "validated": False,
     }

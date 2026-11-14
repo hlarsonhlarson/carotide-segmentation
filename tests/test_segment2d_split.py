@@ -48,3 +48,32 @@ def test_elongated_lumen_is_not_split():
     image[((yy - 80) / 6.0) ** 2 + ((xx - 80) / 11.0) ** 2 <= 1] = 350.0
     r, offset = _radius_px(segment2d.threshold_contour(image, CENTER, "CT", MAX_R))
     assert abs(r - np.sqrt(6 * 11)) < 0.7 and offset < 0.5
+
+
+def test_wall_calcium_is_kept_out_of_the_lumen():
+    image = _image((80, 80, 7), lumen=600.0)
+    yy, xx = np.mgrid[0:160, 0:160]
+    calcium = np.hypot(yy - 80, xx - 86) < 2.5   # bright plaque at the lumen edge
+    image[calcium] = 1100.0
+    contour = segment2d.threshold_contour(image, CENTER, "CT", MAX_R)
+    from skimage.measure import points_in_poly
+    inside = points_in_poly(np.argwhere(calcium).astype(float), np.asarray(contour))
+    assert inside.mean() < 0.2
+
+
+def test_dim_oblique_lumen_is_not_cut_as_calcium():
+    image = _image((80, 80, 7), lumen=330.0)
+    image[(np.mgrid[0:160, 0:160][1] > 80) & (image > 300)] = 470.0  # brighter half, still lumen
+    r, offset = _radius_px(segment2d.threshold_contour(image, CENTER, "CT", MAX_R))
+    assert abs(r - 7) < 0.6
+
+
+def test_calcium_notch_is_recognised_but_a_dark_notch_is_not():
+    image = _image((80, 80, 7), lumen=600.0)
+    yy, xx = np.mgrid[0:160, 0:160]
+    image[np.hypot(yy - 80, xx - 87) < 4] = 1100.0
+    contour = segment2d.threshold_contour(image, CENTER, "CT", MAX_R)
+    assert segment2d.calcium_notch(image, contour)
+    dark = _image((80, 80, 7), lumen=600.0)
+    dark[np.hypot(yy - 80, xx - 87) < 4] = 40.0
+    assert not segment2d.calcium_notch(dark, segment2d.threshold_contour(dark, CENTER, "CT", MAX_R))

@@ -77,6 +77,23 @@ establish accuracy on patient CTA.
   CTA and failed on every section. HU bands are approximations: no
   histological or clinical validation; a normal wall is reported as fibrous.
 
+- Threshold lumen contours on CTA exclude wall calcium: pixels at or above
+  max(1.3x the first-pass lumen median, 500 HU) are cut, so bulb contours no
+  longer swallow calcified plaque. The absolute floor protects dim, obliquely
+  cut sections. "Auto" accepts the resulting notch when the concavity is
+  calcium (upper quartile at the cut); other irregular shapes are rejected.
+- The outer-wall search starts beyond the outermost lumen crossing (notched
+  lumens) and is carried by smoothness through the blurred-lumen zone behind
+  calcium instead of failing. On the reference case walls were found on 82
+  of 83 ICA and 56 of 57 ECA sections (previously none in the bulb).
+- Low-attenuation pixels continuous with tissue outside the wall contour
+  (more than 2 mm^2 outside) are perivascular, not atheroma, and are excluded
+  from plaque. On the reference case this removed fat between the CCA and
+  trachea that had been reported as ~114 mm^3 of atheroma.
+- Wall analyses store their section frame; the 3D path preview places
+  calcified and atheromatous pixels in 3D, and the longitudinal profile has
+  CCA / bifurcation / ICA / ECA range buttons for per-part volumes.
+
 ## Remaining implementation and validation
 
 0. Complete migration of legacy annotations/surfaces to LPS; resampling or

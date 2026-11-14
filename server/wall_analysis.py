@@ -11,7 +11,7 @@ from .lumen_measurements import contour_metrics
 from .plaque_composition import DEFAULTS as COMPOSITION_DEFAULTS, classify_plaque
 
 
-def _ray_radii(contour, center, theta, pixel_mm):
+def _ray_radii(contour, center, theta, pixel_mm, outermost=False):
     points = np.asarray(contour, dtype=float) - center
     a, edge = points, np.roll(points, -1, axis=0) - points
     def cross(x, y):
@@ -24,9 +24,11 @@ def _ray_radii(contour, center, theta, pixel_mm):
         t = np.divide(cross(a, edge), denominator, out=np.zeros(len(a)), where=valid)
         u = np.divide(cross(a, direction), denominator, out=np.zeros(len(a)), where=valid)
         hits = t[valid & (t > 0) & (u >= -1e-8) & (u < 1 - 1e-8)]
-        if len(hits) != 1:
+        if len(hits) == 0 or (len(hits) != 1 and not outermost):
             raise ValueError("Lumen must be star-shaped around the path center")
-        radii.append(float(hits[0]) * pixel_mm)
+        # A lumen notched by excluded calcium crosses some rays several
+        # times; the wall search starts beyond its outermost crossing.
+        radii.append(float(hits.max()) * pixel_mm)
     return np.asarray(radii)
 
 
@@ -121,7 +123,7 @@ def analyze_wall(image, lumen_px, pixel_mm, calcium_hu, min_component_mm2=.5,
     contour_metrics(np.column_stack((np.zeros(len(lumen)), lumen * pixel_mm)))
     center = (np.asarray(image.shape) - 1) / 2
     theta = np.linspace(0, 2 * np.pi, 96, endpoint=False)
-    inner = _ray_radii(lumen, center, theta, pixel_mm)
+    inner = _ray_radii(lumen, center, theta, pixel_mm, outermost=True)
     thickness = np.arange(min_thickness_mm, max_thickness_mm + 1e-8, .2)
     radii = inner[:, None] + thickness
     def sample(r):
@@ -132,13 +134,16 @@ def analyze_wall(image, lumen_px, pixel_mm, calcium_hu, min_component_mm2=.5,
     gradient = (inside - outside) / .5
     # A bright structure is not an outer-wall landmark. Exclude it from the
     # boundary reward rather than following a bone/calcium edge.
-    valid = np.isfinite(gradient) & (inside < calcium_hu) & (outside < calcium_hu)
+    allowed = np.isfinite(gradient) & (inside < calcium_hu) & (outside < calcium_hu)
+    rewarded = allowed.copy()
     if soft_tissue_max_hu is not None:
         # The contrast lumen's own blurred edge is the strongest gradient just
         # outside a lumen contour; without this the boundary locks onto it.
-        # Non-calcified wall and plaque stay below this attenuation.
-        valid &= inside < soft_tissue_max_hu
-    cost = np.where(valid, -np.clip(gradient / 100., -2., 2.), np.inf)
+        # Non-calcified wall and plaque stay below this attenuation. Such
+        # positions stay allowed without reward, so behind calcium blooming
+        # the boundary is carried by smoothness instead of failing outright.
+        rewarded &= inside < soft_tissue_max_hu
+    cost = np.where(rewarded, -np.clip(gradient / 100., -2., 2.), np.where(allowed, 0., np.inf))
     chosen = _closed_boundary(cost, radii)
     strengths = gradient[np.arange(len(theta)), chosen]
     confidence = float(np.mean(strengths >= 30))

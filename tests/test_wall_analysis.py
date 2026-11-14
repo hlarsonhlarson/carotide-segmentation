@@ -73,6 +73,11 @@ def test_wall_endpoint_persists_and_lumen_edits_invalidate(monkeypatch):
             assert response.status_code == 200, response.text
             saved = projects.snapshot(case)["sides"]["right"]["branches"]["cca_ica"]["segmentation"][0]
             assert saved["wall_analysis"]["parameters"]["calcium_hu"] == 600
+            # The stored frame maps section pixels to the same mm as the wall contour.
+            body = response.json(); f = body["section_frame"]
+            r, c = body["wall_contour_px"][0]
+            mapped = np.add(f["origin_mm"], c * f["px_mm"] * np.asarray(f["u"]) + r * f["px_mm"] * np.asarray(f["v"]))
+            assert np.allclose(mapped, body["wall_contour_mm"][0])
             manual_wall = response.json()["wall_contour_px"]
             response = client.post(route + "/wall", json={"calcium_hu": 600, "wall_contour_px": manual_wall})
             assert response.status_code == 200, response.text
