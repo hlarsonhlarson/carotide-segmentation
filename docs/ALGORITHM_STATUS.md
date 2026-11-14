@@ -45,6 +45,15 @@ establish accuracy on patient CTA.
 - Worker inference runs outside the event loop, rejects concurrent jobs, and
   configures PyTorch threading once per process.
 - HTTP errors from the worker preserve their actual details.
+- CFD averaging interpolates the exact start of the final recorded cardiac
+  period instead of dropping its boundary sample. Partial runs are explicitly
+  identified. Two full cycles are compared using phase-aligned global RMS of
+  WSS vectors and pressure, with absolute differences and a stated 5% tolerance.
+  Source intervals larger than one tenth of a cycle prevent a positive
+  periodicity assessment. Agreement is not a claim of solver/mesh validation.
+- CFD extraction verifies wall node IDs, coordinates/units and field dimensions
+  on every snapshot. Invalid/missing/nonfinite fields and mismatched node
+  ordering are rejected. OSI at zero WSS has an explicit validity mask.
 
 ## Remaining implementation and validation
 
@@ -73,8 +82,12 @@ establish accuracy on patient CTA.
 8. Ophthalmic artery tracing and optional outlet support are NOT implemented.
 9. Surface/volume meshing exists; prism boundary layers and three-level mesh
    convergence are not established by this change.
-10. SU2 export/run/postprocessing exists; outlet calibration and periodic-cycle
-    convergence need independent verification.
+10. SU2 export/run/postprocessing and sampled cycle comparison exist. Outlet
+    calibration, mass balance, mesh/time-step convergence and real-run periodic
+    convergence remain unverified. The existing 0.5 skin-friction-to-WSS scale
+    remains a project convention pending independent dimensional verification.
+    The deployed Docker backend currently lacks the native SU2/pysu2/MPI
+    configuration, so synthetic temporal/VTK checks are not a new CFD run.
 11. Expert-reference Dice/HD95, observer repeatability and CFD sensitivity runs
     require reference segmentations and completed simulation experiments.
 

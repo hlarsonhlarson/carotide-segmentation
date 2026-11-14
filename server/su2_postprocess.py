@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 import vtk
 from vtk.util import numpy_support
+from .cfd_temporal import validate_series, last_window, cycle_quality
 
 log = logging.getLogger("carotid_server")
 
@@ -57,8 +58,17 @@ def _wall_point_indices(surf, wall_face_id: int = 1):
     wall-tagged triangle, and that triangle connectivity re-indexed into
     the compact wall-only point list (0..len(wall)-1) for building a
     standalone wall-surface mesh to send to the client."""
-    face_ids = numpy_support.vtk_to_numpy(surf.GetCellData().GetArray("ModelFaceID"))
-    gid = numpy_support.vtk_to_numpy(surf.GetPointData().GetArray("GlobalNodeID"))
+    face_array = surf.GetCellData().GetArray("ModelFaceID")
+    node_array = surf.GetPointData().GetArray("GlobalNodeID")
+    if face_array is None or node_array is None:
+        raise ValueError("CFD surface requires ModelFaceID and GlobalNodeID")
+    face_ids = numpy_support.vtk_to_numpy(face_array)
+    gid = numpy_support.vtk_to_numpy(node_array)
+    if (gid.shape != (surf.GetNumberOfPoints(),) or not np.isfinite(gid).all()
+            or np.any(gid < 1) or np.any(gid != np.floor(gid)) or len(np.unique(gid)) != len(gid)):
+        raise ValueError("CFD surface has invalid or duplicate GlobalNodeID values")
+    if face_ids.shape != (surf.GetNumberOfCells(),):
+        raise ValueError("CFD surface has invalid ModelFaceID values")
     wall_cells = np.nonzero(face_ids == wall_face_id)[0]
     if len(wall_cells) == 0:
         raise ValueError("no wall-tagged triangles in this surface")
@@ -69,6 +79,8 @@ def _wall_point_indices(surf, wall_face_id: int = 1):
     local_of = {}
     for ci in wall_cells:
         cell = surf.GetCell(int(ci))
+        if cell.GetNumberOfPoints() != 3:
+            raise ValueError("CFD wall surface must contain triangles")
         ids = [cell.GetPointId(k) for k in range(3)]
         tri = []
         for lid in ids:
@@ -106,6 +118,12 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
     with tempfile.TemporaryDirectory(prefix="su2_post_") as tmp:
         surf = _read_vtp_from_bytes(vtp_bytes, Path(tmp))
     wall_vol_idx, triangles = _wall_point_indices(surf)
+    surface_ids = numpy_support.vtk_to_numpy(surf.GetPointData().GetArray("GlobalNodeID"))
+    order = np.argsort(surface_ids)
+    surface_local = order[np.searchsorted(surface_ids[order], wall_vol_idx + 1)]
+    expected_points_mm = numpy_support.vtk_to_numpy(surf.GetPoints().GetData())[surface_local]
+    if not np.isfinite(time_step_s) or time_step_s <= 0:
+        raise ValueError("CFD output time step must be positive")
 
     files = _flow_files_sorted(run_dir)
     if not files:
@@ -121,6 +139,12 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
         reader.Update()
         ug = reader.GetOutput()
         pd = ug.GetPointData()
+        if ug.GetPoints() is None or ug.GetNumberOfPoints() <= int(wall_vol_idx.max()):
+            raise ValueError(f"CFD frame {step} does not contain the expected mesh nodes")
+        all_pts = numpy_support.vtk_to_numpy(ug.GetPoints().GetData())
+        frame_points_mm = all_pts[wall_vol_idx] * 1000.
+        if not np.allclose(frame_points_mm, expected_points_mm, atol=1e-3, rtol=0):
+            raise ValueError(f"CFD frame {step} node order or geometry does not match the exported wall")
 
         if points_mm is None:
             # The flow_*.vtu snapshot's own point coordinates are in
@@ -136,12 +160,19 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
             # consumer of this field (the Swift viewer, any future one)
             # on the same mm convention every other surface in this app
             # already uses.
-            all_pts = numpy_support.vtk_to_numpy(ug.GetPoints().GetData())
-            points_mm = (all_pts[wall_vol_idx] * 1000.0).astype(np.float32)
+            points_mm = frame_points_mm.astype(np.float32)
 
-        cf = numpy_support.vtk_to_numpy(pd.GetArray("Skin_Friction_Coefficient"))
+        cf_array, pressure_array = pd.GetArray("Skin_Friction_Coefficient"), pd.GetArray("Pressure")
+        if cf_array is None or pressure_array is None:
+            raise ValueError(f"CFD frame {step} is missing skin friction or pressure output")
+        cf = numpy_support.vtk_to_numpy(cf_array)
+        pressure_values = numpy_support.vtk_to_numpy(pressure_array)
+        if cf.shape != (ug.GetNumberOfPoints(), 3) or pressure_values.shape != (ug.GetNumberOfPoints(),):
+            raise ValueError(f"CFD frame {step} has invalid WSS or pressure dimensions")
         wss_vec = (0.5 * cf[wall_vol_idx]).astype(np.float32)
-        pressure = numpy_support.vtk_to_numpy(pd.GetArray("Pressure"))[wall_vol_idx].astype(np.float32)
+        pressure = pressure_values[wall_vol_idx].astype(np.float32)
+        if not np.isfinite(wss_vec).all() or not np.isfinite(pressure).all():
+            raise ValueError(f"CFD frame {step} contains nonfinite wall fields")
 
         wss_frames.append(wss_vec)
         pressure_frames.append(pressure)
@@ -158,33 +189,18 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
     }
 
 
-def _settled_cycle_mask(times_s: np.ndarray, cycle_s: float):
-    """Restricts time-averaging to the *last* full cardiac cycle present
-    in the data — the first cycle still carries startup transients (the
-    solver begins from a zero/uniform initial condition, not a converged
-    periodic state), so including it would bias TAWSS/OSI toward values
-    that don't reflect the actual periodic flow. Falls back to every
-    frame available if there's less than one full cycle's worth yet (a
-    partial/cancelled run) — better to show a provisional, clearly-partial
-    result than none at all."""
-    if times_s.size == 0:
-        return np.zeros(0, dtype=bool)
-    t_end = times_s[-1]
-    mask = times_s >= (t_end - cycle_s + 1e-9)
-    return mask if mask.any() else np.ones_like(times_s, dtype=bool)
-
-
 def compute_derived_fields(series: dict, cycle_s: float) -> dict:
-    """TAWSS/OSI/RRT/mean pressure over the settled last cycle, plus the
+    """TAWSS/OSI/RRT/mean pressure over the last recorded cycle, plus the
     raw per-frame WSS-magnitude/pressure time series (for an instantaneous
     frame-scrubbing view) — see module docstring for the formulas."""
-    times_s = series["times_s"]
-    wss_vec = series["wss_vec_pa"]  # (T, N, 3)
-    pressure = series["pressure_pa"]  # (T, N)
+    times_s = np.asarray(series["times_s"], dtype=float)
+    wss_vec = np.asarray(series["wss_vec_pa"], dtype=float)  # (T, N, 3)
+    pressure = np.asarray(series["pressure_pa"], dtype=float)  # (T, N)
+    validate_series(times_s, wss_vec, pressure, cycle_s)
 
-    mask = _settled_cycle_mask(times_s, cycle_s)
-    t_settled = times_s[mask]
-    w = wss_vec[mask]  # (T', N, 3)
+    t_settled, w = last_window(times_s, wss_vec, cycle_s)
+    _, window_pressure = last_window(times_s, pressure, cycle_s)
+    quality = cycle_quality(times_s, wss_vec, pressure, cycle_s)
 
     wss_mag = np.linalg.norm(wss_vec, axis=2)  # (T, N) — every frame, for scrubbing
 
@@ -199,14 +215,17 @@ def compute_derived_fields(series: dict, cycle_s: float) -> dict:
     tawss_safe = np.maximum(tawss, 1e-9)
     osi = 0.5 * (1.0 - mean_vec_mag / tawss_safe)
     osi = np.clip(osi, 0.0, 0.5)
+    undefined_osi = tawss <= 1e-9
+    osi[undefined_osi] = 0.  # finite display placeholder, explicitly masked below
+    quality["undefined_osi_nodes"] = int(undefined_osi.sum())
 
     denom = (1.0 - 2.0 * osi) * tawss_safe
     denom_safe = np.maximum(denom, 1.0 / RRT_CLAMP_PA_INV)  # avoid a real 1/0 before np.where selects it away
     rrt = np.where(denom > 1.0 / RRT_CLAMP_PA_INV, 1.0 / denom_safe, RRT_CLAMP_PA_INV)
 
     mean_pressure = (
-        np.trapezoid(pressure[mask], t_settled, axis=0) / (t_settled[-1] - t_settled[0])
-        if len(t_settled) >= 2 else pressure[mask].mean(axis=0)
+        np.trapezoid(window_pressure, t_settled, axis=0) / (t_settled[-1] - t_settled[0])
+        if len(t_settled) >= 2 else window_pressure.mean(axis=0)
     )
 
     return {
@@ -217,6 +236,9 @@ def compute_derived_fields(series: dict, cycle_s: float) -> dict:
         "wss_mag_frames_pa": wss_mag.astype(np.float32),  # (T, N)
         "pressure_frames_pa": pressure.astype(np.float32),  # (T, N)
         "times_s": times_s,
+        "temporal_quality": quality,
+        "osi_valid_mask": ~undefined_osi,
+        # Legacy field retained for old clients; quality reports periodicity.
         "settled_cycle_start_s": float(t_settled[0]) if len(t_settled) else 0.0,
     }
 

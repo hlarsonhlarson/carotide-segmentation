@@ -1260,6 +1260,8 @@ def start_su2_postprocess(case_id: str, side: str):
                     "triangles": series["triangles"].tolist(),
                     "times_s": derived["times_s"].tolist(),
                     "settled_cycle_start_s": derived["settled_cycle_start_s"],
+                    "temporal_quality": derived["temporal_quality"],
+                    "osi_valid_mask": derived["osi_valid_mask"].tolist(),
                     "tawss_pa": derived["tawss_pa"].tolist(),
                     "osi": derived["osi"].tolist(),
                     "rrt_pa_inv": derived["rrt_pa_inv"].tolist(),
