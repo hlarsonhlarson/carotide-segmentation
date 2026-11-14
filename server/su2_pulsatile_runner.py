@@ -56,6 +56,19 @@ def _progress(tag, **info):
     print(f"{tag} {json.dumps(info)}", flush=True)
 
 
+def advance_outlet(model, dt, flow, previous_applied):
+    """Advance RC state independently of the relaxed boundary pressure."""
+    raw = model.step(dt, flow)
+    applied = previous_applied + COUPLING_RELAXATION * (raw - previous_applied)
+    clamped = not P_APPLIED_MIN_PA <= applied <= P_APPLIED_MAX_PA
+    applied = min(max(applied, P_APPLIED_MIN_PA), P_APPLIED_MAX_PA)
+    # Only an active clamp projects the RC state; this safeguard is recorded
+    # explicitly because it violates the circuit's unmodified charge balance.
+    if clamped:
+        model.P = applied - model.Rp * flow
+    return applied, clamped
+
+
 def marker_area_and_flow(driver, marker_id, vel_idx, comm):
     """MPI halo-safe: only sums over nodes this rank actually owns
     (GetNodeDomain), then all-reduces — a marker's nodes are split
@@ -131,8 +144,9 @@ def main():
     q_ica_mean = mean_flow * ica_fraction
     q_eca_mean = mean_flow * (1.0 - ica_fraction)
     rcr = calibrate_two_outlet_rcr(q_ica_mean, q_eca_mean, ica_map_pa, eca_map_pa)
-    wk_ica = Windkessel(*rcr["ica"], P_init=ica_map_pa)
-    wk_eca = Windkessel(*rcr["eca"], P_init=eca_map_pa)
+    # P is the capacitor pressure, excluding the proximal Rp*Q drop.
+    wk_ica = Windkessel(*rcr["ica"], P_init=ica_map_pa - rcr["ica"][0] * q_ica_mean)
+    wk_eca = Windkessel(*rcr["eca"], P_init=eca_map_pa - rcr["eca"][0] * q_eca_mean)
 
     if is_root:
         _progress(
@@ -142,6 +156,7 @@ def main():
             inlet_area_mm2=inlet_area * 1e6,
             flux_convention="outward_su2_normals_v2",
             flux_method="nodal_boundary_velocity_quadrature",
+            rcr_state_scheme="independent_backward_euler_v2",
         )
 
     n_cca = driver.GetNumberMarkerNodes(id_cca) if id_cca >= 0 else 0
@@ -167,22 +182,8 @@ def main():
 
         _, q_ica = marker_area_and_flow(driver, id_ica, vel_idx, comm)
         _, q_eca = marker_area_and_flow(driver, id_eca, vel_idx, comm)
-        p_ica_raw = wk_ica.step(dt, q_ica)
-        p_eca_raw = wk_eca.step(dt, q_eca)
-        p_ica_applied += COUPLING_RELAXATION * (p_ica_raw - p_ica_applied)
-        p_eca_applied += COUPLING_RELAXATION * (p_eca_raw - p_eca_applied)
-        ica_clamped = not P_APPLIED_MIN_PA <= p_ica_applied <= P_APPLIED_MAX_PA
-        eca_clamped = not P_APPLIED_MIN_PA <= p_eca_applied <= P_APPLIED_MAX_PA
-        p_ica_applied = min(max(p_ica_applied, P_APPLIED_MIN_PA), P_APPLIED_MAX_PA)
-        p_eca_applied = min(max(p_eca_applied, P_APPLIED_MIN_PA), P_APPLIED_MAX_PA)
-        # Clamping only the *applied* pressure would still let the
-        # Windkessel's own internal state (wk_ica.P/wk_eca.P) drift
-        # unbounded underneath it — reset it back in sync so next step's
-        # relaxation starts from the pressure actually imposed on the
-        # flow, not a runaway internal value the clamp is silently
-        # overriding every single step.
-        wk_ica.P = p_ica_applied - wk_ica.Rp * q_ica
-        wk_eca.P = p_eca_applied - wk_eca.Rp * q_eca
+        p_ica_applied, ica_clamped = advance_outlet(wk_ica, dt, q_ica, p_ica_applied)
+        p_eca_applied, eca_clamped = advance_outlet(wk_eca, dt, q_eca, p_eca_applied)
         if id_ica >= 0:
             driver.SetMarkerCustomOutletPressure(id_ica, p_ica_applied)
         if id_eca >= 0:

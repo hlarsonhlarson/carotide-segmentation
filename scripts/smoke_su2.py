@@ -16,8 +16,7 @@ import numpy as np
 from native_web_backend import environment, check_solver
 
 
-def duct_mesh():
-    nx, ny, nz = 8, 4, 4
+def duct_mesh(nx=8, ny=4, nz=4):
     points = np.array([(i * .03 / nx, j * .004 / ny, k * .004 / nz)
                        for i in range(nx + 1) for j in range(ny + 1) for k in range(nz + 1)])
     def node(i, j, k):
@@ -93,11 +92,18 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=4, help="Physical steps (4 by default; 600 spans three seconds)")
     parser.add_argument("--inner-iterations", type=int, default=20)
+    parser.add_argument("--nx", type=int, default=8, help="Cells along the duct")
+    parser.add_argument("--cross-section", type=int, default=4, help="Even number of cells per transverse axis")
+    parser.add_argument("--timeout-s", type=int, default=90)
     args = parser.parse_args()
     if not 1 <= args.steps <= 2000:
         parser.error("--steps must be between 1 and 2000")
     if not 1 <= args.inner_iterations <= 500:
         parser.error("--inner-iterations must be between 1 and 500")
+    if not 2 <= args.nx <= 64 or not 2 <= args.cross_section <= 32 or args.cross_section % 2:
+        parser.error("Use nx in 2..64 and an even cross-section in 2..32")
+    if not 1 <= args.timeout_s <= 1800:
+        parser.error("--timeout-s must be between 1 and 1800")
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     env = environment()
@@ -106,7 +112,7 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     # Import after the solver environment is configured.
     from server import su2_run
-    mesh, points_m, markers = duct_mesh()
+    mesh, points_m, markers = duct_mesh(args.nx, args.cross_section, args.cross_section)
     (output / "mesh.su2").write_text(mesh)
     vtp_bytes = wall_surface(output, points_m, markers)
     cfg = output / "run.cfg"
@@ -124,7 +130,7 @@ def main():
     thread = threading.Thread(target=su2_run.run_in_background,
                               args=(job, output, cfg, params), daemon=True)
     thread.start()
-    thread.join(timeout=90)
+    thread.join(timeout=args.timeout_s)
     if thread.is_alive():
         su2_run.cancel_run(job)
         thread.join(timeout=10)
@@ -137,7 +143,21 @@ def main():
     fields = su2_postprocess.compute_derived_fields(series, 1.)
     print("Postprocessing:", json.dumps(fields["temporal_quality"]))
     from server.cfd_balance import summarize_balance
-    print("Flow balance:", json.dumps(summarize_balance(output, 1., float(series["times_s"][-1]))))
+    balance = summarize_balance(output, 1., float(series["times_s"][-1]))
+    print("Flow balance:", json.dumps(balance))
+    xyz, triangles = series["points_mm"], series["triangles"]
+    areas = .5 * np.linalg.norm(np.cross(xyz[triangles[:, 1]] - xyz[triangles[:, 0]],
+                                        xyz[triangles[:, 2]] - xyz[triangles[:, 0]]), axis=1)
+    weights = np.bincount(triangles.ravel(), weights=np.repeat(areas / 3., 3), minlength=len(xyz))
+    summary = {
+        "geometry": "synthetic_rectangular_duct", "validated": False,
+        "nx": args.nx, "cross_section": args.cross_section, "mesh_nodes": len(points_m),
+        "steps": args.steps, "inner_iterations": args.inner_iterations, "time_step_s": su2_run.TIME_STEP_S,
+        "elapsed_s": job.get("elapsed_s"), "temporal_quality": fields["temporal_quality"],
+        "flow_balance": balance,
+        "area_weighted_tawss_pa": float(np.average(fields["tawss_pa"], weights=weights)),
+    }
+    (output / "diagnostic_summary.json").write_text(json.dumps(summary, indent=2))
     print("Synthetic CFD smoke test completed. This is not a validated patient simulation.")
 
 
