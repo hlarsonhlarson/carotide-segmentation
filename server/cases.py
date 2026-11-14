@@ -1,4 +1,6 @@
 """In-memory case registry. One process, one user — no DB needed yet."""
+import os
+import time
 import uuid
 import threading
 from dataclasses import dataclass, field
@@ -104,6 +106,7 @@ class CaseState:
     stale: dict = field(default_factory=lambda: {side: set() for side in ("left", "right")})
     saved_artifacts: dict = field(default_factory=dict)
     project_warnings: list = field(default_factory=list)
+    last_access: float = field(default_factory=time.monotonic, repr=False)
 
     def __post_init__(self):
         self.array_min = float(self.array.min())
@@ -117,6 +120,34 @@ class CaseState:
 
 
 _CASES: dict[str, CaseState] = {}
+_REGISTRY_LOCK = threading.Lock()
+# Each case holds a full CT volume plus mesh bytes; without a bound every new
+# study load stays resident until the process restarts.
+MAX_CASES = max(1, int(os.environ.get("CAROTID_MAX_CASES", "3")))
+
+
+def _has_running_job(case: CaseState) -> bool:
+    jobs = [case.autoseed_job, *case.su2_mesh_jobs.values(),
+            *case.su2_run_jobs.values(), *case.su2_postprocess_jobs.values()]
+    return any(job and job.get("state") == "running" for job in jobs)
+
+
+def _evictable(case: CaseState) -> bool:
+    """Only drop a case when nothing would be lost: its edits are autosaved
+    into a project folder, or it has no edits at all."""
+    if _has_running_job(case):
+        return False
+    unsaved = any(case.control_points.values()) or any(case.segmentation_series.values())
+    return case.project_dir is not None or not unsaved
+
+
+def _evict_over_limit(keep: str) -> None:
+    candidates = sorted(
+        (c for c in _CASES.values() if c.case_id != keep and _evictable(c)),
+        key=lambda c: c.last_access,
+    )
+    while len(_CASES) > MAX_CASES and candidates:
+        _CASES.pop(candidates.pop(0).case_id, None)
 
 
 def create(array, spacing_mm, origin_mm, modality, source_path, series_uid=None) -> CaseState:
@@ -130,9 +161,14 @@ def create(array, spacing_mm, origin_mm, modality, source_path, series_uid=None)
         source_path=source_path,
         series_uid=series_uid,
     )
-    _CASES[case_id] = case
+    with _REGISTRY_LOCK:
+        _CASES[case_id] = case
+        _evict_over_limit(keep=case_id)
     return case
 
 
 def get(case_id: str) -> CaseState | None:
-    return _CASES.get(case_id)
+    case = _CASES.get(case_id)
+    if case is not None:
+        case.last_access = time.monotonic()
+    return case
