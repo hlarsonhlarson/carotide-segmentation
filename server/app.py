@@ -524,6 +524,32 @@ def clear_centerline(case_id: str, side: str, branch: str):
     return {"ok": True}
 
 
+@app.post("/cases/{case_id}/centerline/{side}/swap_branches")
+@workflow.edit
+def swap_branches(case_id: str, side: str):
+    """Exchange the CCA→ICA and CCA→ECA paths, contours and annotations.
+
+    Automatic labelling can assign the internal and external carotid the
+    wrong way round. Swapping keeps every point and contour; only which
+    branch they belong to changes. Surface, mesh and CFD are invalidated
+    because their outlets are named after the branches.
+    """
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    if side not in SIDES:
+        raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    ica, eca = (side, "cca_ica"), (side, "cca_eca")
+    for store in (case.control_points, case.centerline_points, case.segmentation_series):
+        a, b = store.pop(ica, None), store.pop(eca, None)
+        if b is not None:
+            store[ica] = b
+        if a is not None:
+            store[eca] = a
+    workflow.invalidate(case, side)
+    return {"side": side, "swapped": True}
+
+
 @app.get("/cases/{case_id}/control_points")
 @workflow.locked
 def get_control_points(case_id: str):

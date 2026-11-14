@@ -221,3 +221,53 @@ def test_invalid_saved_coordinates_are_rejected(case, tmp_path):
     data['sides']['right']['branches']['cca_ica']['control_points'] = [[100, 0, 0]]
     with pytest.raises(ValueError, match='outside'):
         projects.restore(case, data, tmp_path)
+
+
+
+def test_swap_branches_exchanges_paths_contours_and_invalidates_surface(client, case):
+    ica = [[1, 1, 1], [5, 5, 5]]; eca = [[1, 1, 1], [5, 2, 7]]
+    case.control_points[("right", "cca_ica")] = ica
+    case.control_points[("right", "cca_eca")] = eca
+    case.centerline_points[("right", "cca_ica")] = ica
+    case.centerline_points[("right", "cca_eca")] = eca
+    case.segmentation_series[("right", "cca_ica")] = [{"tag": "ica"}]
+    case.built_surfaces["right"] = b"stl"
+    cases._CASES[case.case_id] = case
+    response = client.post(f"/cases/{case.case_id}/centerline/right/swap_branches")
+    assert response.status_code == 200
+    assert case.control_points[("right", "cca_ica")] == eca
+    assert case.control_points[("right", "cca_eca")] == ica
+    assert ("right", "cca_ica") not in case.segmentation_series
+    assert case.segmentation_series[("right", "cca_eca")] == [{"tag": "ica"}]
+    assert "right" not in case.built_surfaces
+
+
+def test_autosave_still_detects_foreign_manifest_after_own_writes(case, tmp_path):
+    import json
+    from fastapi import HTTPException
+    from server import projects
+    case.project_dir = str(tmp_path)
+    projects.atomic_write(tmp_path / 'project.json', projects._manifest_json(projects.snapshot(case)))
+    projects.autosave(case)
+    projects.autosave(case)  # unchanged since our own write: no re-parse needed
+    foreign = json.loads((tmp_path / 'project.json').read_text())
+    foreign['project_id'] = 'someone-else'
+    (tmp_path / 'project.json').write_text(json.dumps(foreign))
+    with pytest.raises(HTTPException) as error:
+        projects.autosave(case)
+    assert error.value.status_code == 409
+
+
+def test_restitch_reuses_hops_and_matches_fresh_paths():
+    from server import centerline_path
+    rng = np.random.default_rng(1)
+    volume = rng.uniform(0, 80, (40, 40, 40)).astype(np.float32)
+    volume[5:35, 18:22, 18:22] = 400
+    spacing = np.array([1., 1., 1.])
+    points = [[6, 20, 20], [20, 20, 20], [33, 20, 20]]
+    first = centerline_path.stitch_full_path(volume, spacing, 'CT', points)
+    again = centerline_path.stitch_full_path(volume, spacing, 'CT', points)
+    fresh = [points[0]]
+    for a, b in zip(points, points[1:]):
+        fresh.extend(centerline_path.stitch(volume, spacing, 'CT', a, b)[1:])
+    assert first == again == fresh

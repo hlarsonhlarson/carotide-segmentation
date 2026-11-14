@@ -69,15 +69,35 @@ def _manifest_json(data) -> bytes:
     return json.dumps(data, allow_nan=False, separators=(',', ':')).encode()
 
 
+def _stamp(path):
+    st = os.stat(path)
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+# {case_id: (manifest path, stat stamp)} of the manifest this process last
+# wrote. Parsing a 1 MB manifest only to read its project_id cost ~20 ms per
+# edit; an unchanged file (same inode, mtime and size) is still ours.
+_LAST_WRITTEN: dict = {}
+
+
 def autosave(case):
     if case.project_dir:
         folder = Path(case.project_dir)
-        current = json.loads((folder / 'project.json').read_text())
-        if current.get('project_id') != case.project_id:
-            raise HTTPException(409, 'project ownership changed; reopen the project')
+        manifest = folder / 'project.json'
+        known = _LAST_WRITTEN.get(case.case_id)
         try:
-            atomic_write(folder / 'project.json', _manifest_json(snapshot(case)))
+            unchanged = known is not None and known[0] == str(manifest) and known[1] == _stamp(manifest)
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            current = json.loads(manifest.read_text())
+            if current.get('project_id') != case.project_id:
+                raise HTTPException(409, 'project ownership changed; reopen the project')
+        try:
+            atomic_write(manifest, _manifest_json(snapshot(case)))
+            _LAST_WRITTEN[case.case_id] = (str(manifest), _stamp(manifest))
         except OSError as e:
+            _LAST_WRITTEN.pop(case.case_id, None)
             raise HTTPException(507, f'Autosave failed; edits remain in memory. Save again before closing: {e}') from e
 
 

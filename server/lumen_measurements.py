@@ -24,15 +24,18 @@ def contour_metrics(contour_mm):
         d, e = b - a, c - a
         return d[..., 0] * e[..., 1] - d[..., 1] * e[..., 0]
     n = len(xy)
-    for i in range(n):
-        a, b = xy[i], xy[(i + 1) % n]
-        indices = np.arange(i + 2, n - (i == 0))
-        c, d = xy[indices], xy[(indices + 1) % n]
-        overlaps = np.all(np.maximum(np.minimum(a, b), np.minimum(c, d)) <=
-                          np.minimum(np.maximum(a, b), np.maximum(c, d)) + 1e-10, axis=1)
-        if np.any(overlaps & (orient(a, b, c) * orient(a, b, d) <= 1e-12)
-                  & (orient(c, d, a) * orient(c, d, b) <= 1e-12)):
-            raise ValueError("Contour self-intersects")
+    # Every pair of nonadjacent segments (i, j), j >= i + 2, except the
+    # closing pair (0, n - 1), tested in one vectorized pass.
+    i, j = np.triu_indices(n, k=2)
+    keep = ~((i == 0) & (j == n - 1))
+    i, j = i[keep], j[keep]
+    a, b = xy[i], xy[(i + 1) % n]
+    c, d = xy[j], xy[(j + 1) % n]
+    overlaps = np.all(np.maximum(np.minimum(a, b), np.minimum(c, d)) <=
+                      np.minimum(np.maximum(a, b), np.maximum(c, d)) + 1e-10, axis=1)
+    if np.any(overlaps & (orient(a, b, c) * orient(a, b, d) <= 1e-12)
+              & (orient(c, d, a) * orient(c, d, b) <= 1e-12)):
+        raise ValueError("Contour self-intersects")
     area = abs(float(np.dot(xy[:, 0], np.roll(xy[:, 1], -1)) -
                      np.dot(xy[:, 1], np.roll(xy[:, 0], -1)))) / 2
     if area < 1e-8:
