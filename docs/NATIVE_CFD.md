@@ -74,6 +74,12 @@ This verifies execution and output compatibility only. The run is far shorter
 than a cardiac cycle and does not validate the Windkessel coupling, mass
 balance, physiological results, mesh convergence or patient segmentation.
 
+For an extended synthetic diagnostic, use `--steps 600`; optionally set
+`--inner-iterations 80`. Each run needs a new output directory and retains the
+same 90-second execution limit. The script reports temporal repetition and
+the boundary nodal-velocity balance separately. A successful process exit or
+periodicity check does not imply an acceptable flux balance.
+
 ## Return to the Docker API
 
 Save the project, then:

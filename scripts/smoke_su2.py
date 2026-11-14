@@ -91,7 +91,13 @@ def wall_surface(output, points_m, markers):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--steps", type=int, default=4, help="Physical steps (4 by default; 600 spans three seconds)")
+    parser.add_argument("--inner-iterations", type=int, default=20)
     args = parser.parse_args()
+    if not 1 <= args.steps <= 2000:
+        parser.error("--steps must be between 1 and 2000")
+    if not 1 <= args.inner_iterations <= 500:
+        parser.error("--inner-iterations must be between 1 and 500")
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     env = environment()
@@ -104,8 +110,9 @@ def main():
     (output / "mesh.su2").write_text(mesh)
     vtp_bytes = wall_surface(output, points_m, markers)
     cfg = output / "run.cfg"
-    cfg.write_text(su2_run._cfg_text("mesh.su2", 4, 20., [1., 0., 0.])
-                   .replace("OUTPUT_WRT_FREQ= 10", "OUTPUT_WRT_FREQ= 1"))
+    cfg.write_text(su2_run._cfg_text("mesh.su2", args.steps, 20., [1., 0., 0.])
+                   .replace("OUTPUT_WRT_FREQ= 10", "OUTPUT_WRT_FREQ= 1")
+                   .replace(f"INNER_ITER= {su2_run.INNER_ITER}", f"INNER_ITER= {args.inner_iterations}"))
     params = output / "run_params.json"
     params.write_text(json.dumps({
         "case_name": "synthetic_duct_smoke", "psv_cms": 60., "edv_cms": 20.,
@@ -129,6 +136,8 @@ def main():
     series = su2_postprocess.extract_wall_time_series(output, vtp_bytes, su2_run.TIME_STEP_S)
     fields = su2_postprocess.compute_derived_fields(series, 1.)
     print("Postprocessing:", json.dumps(fields["temporal_quality"]))
+    from server.cfd_balance import summarize_balance
+    print("Flow balance:", json.dumps(summarize_balance(output, 1., float(series["times_s"][-1]))))
     print("Synthetic CFD smoke test completed. This is not a validated patient simulation.")
 
 

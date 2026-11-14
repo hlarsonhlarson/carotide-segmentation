@@ -162,6 +162,14 @@ export function CFD({
           `· ${status.step} / ${status.total_steps}`}
       </p>
       {status.error && <p role="alert">{status.error}</p>}
+      {status.q_inlet_mlps != null && <p>
+        Расход, мл/с: вход {status.q_inlet_mlps.toFixed(2)} ·
+        ICA {status.q_ica_mlps.toFixed(2)} · ECA {status.q_eca_mlps.toFixed(2)}.
+        {" "}Невязка массы: {status.mass_imbalance_relative == null
+          ? "относительная не определена" : `${(status.mass_imbalance_relative * 100).toFixed(2)}%`}.
+        {(status.inlet_reversed || status.ica_reversed || status.eca_reversed) && " Обнаружен обратный поток."}
+        {(status.ica_pressure_clamped || status.eca_pressure_clamped) && " Сработало ограничение давления."}
+      </p>}
       <button
         disabled={busy || post === "running" || status.state === "idle"}
         onClick={() => action(() => request(route + "/su2_postprocess", {}))}
@@ -211,6 +219,19 @@ export function CFD({
               для отображения используется 0. Маска валидности включена в JSON.
             </p>}
           </section> : <p>В сохранённом результате нет проверки периодичности. Повторите обработку исходных кадров.</p>}
+          {result.flow_balance?.status === "measured" ? <section aria-label="Баланс потока CFD">
+            <h3>Баланс потока</h3>
+            <p>Оценка по узловым скоростям на границах; это не невязка консервативных численных потоков решателя.</p>
+            <p>Средняя абсолютная невязка: {result.flow_balance.mean_absolute_imbalance_mlps.toPrecision(3)} мл/с ·
+              относительная {result.flow_balance.relative_mean_absolute_imbalance == null ? "не определена"
+                : `${(result.flow_balance.relative_mean_absolute_imbalance * 100).toFixed(2)}%`}.</p>
+            <p>Объём за {result.flow_balance.full_cycle ? "последний цикл" : "неполный интервал"}:
+              {" "}вход {result.flow_balance.inlet_volume_ml.toFixed(3)} мл ·
+              выходы {result.flow_balance.outlet_volume_ml.toFixed(3)} мл.</p>
+            <p>Отсчёты с обратным потоком: вход {result.flow_balance.reverse_samples.inlet},
+              {" "}ICA {result.flow_balance.reverse_samples.ica}, ECA {result.flow_balance.reverse_samples.eca}.
+              Ограничение давления сработало на {result.flow_balance.pressure_clamped_steps} шагах.</p>
+          </section> : <p>Записанных данных для проверки баланса потока нет.</p>}
           <select
             aria-label="Показатель CFD"
             value={field}

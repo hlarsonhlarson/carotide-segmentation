@@ -17,6 +17,7 @@ from . import workflow, projects, storage
 from .lumen_profiles import fwhm_contour
 from .wall_analysis import analyze_wall, measure_wall_section
 from .longitudinal_analysis import analyze_series
+from .cfd_balance import summarize_balance
 from .lumen_measurements import contour_metrics, nascet_estimate
 
 from pathlib import Path
@@ -1261,6 +1262,7 @@ def start_su2_postprocess(case_id: str, side: str):
                     "times_s": derived["times_s"].tolist(),
                     "settled_cycle_start_s": derived["settled_cycle_start_s"],
                     "temporal_quality": derived["temporal_quality"],
+                    "flow_balance": summarize_balance(run_dir, cycle_s, derived["temporal_quality"]["window_end_s"]),
                     "osi_valid_mask": derived["osi_valid_mask"].tolist(),
                     "tawss_pa": derived["tawss_pa"].tolist(),
                     "osi": derived["osi"].tolist(),

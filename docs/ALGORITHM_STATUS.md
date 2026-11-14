@@ -54,6 +54,15 @@ establish accuracy on patient CTA.
 - CFD extraction verifies wall node IDs, coordinates/units and field dimensions
   on every snapshot. Invalid/missing/nonfinite fields and mismatched node
   ordering are rejected. OSI at zero WSS has an explicit validity mask.
+- The SU2 boundary-normal sign is corrected: the wrapper returns inward
+  normals, which must be negated for outward flux. This was verified against
+  the installed SU2 source and a runtime duct-normal probe. The correction
+  applies both to RCR input flows and diagnostics.
+- The runner records same-state inlet/outlet flux estimates after each solve,
+  reverse-flow indicators and pressure-clamp events in `boundary_flows.csv`.
+  Postprocessing reports last-cycle integrated volumes and absolute imbalance;
+  the estimate uses boundary nodal velocities, not conservative numerical
+  fluxes from the solver, so it is not a residual convergence certificate.
 
 ## Remaining implementation and validation
 
@@ -89,6 +98,12 @@ establish accuracy on patient CTA.
     The web interface can now proxy a native macOS API with verified
     SU2/pysu2/MPI imports and custom-boundary methods. A four-step synthetic
     duct run completed through the normal solver and postprocessing chain.
+    Subsequent 600-step duct runs with corrected flux signs showed no reverse
+    flow in the last cycle and about 2% cycle-to-cycle WSS RMS differences,
+    but boundary nodal-flux imbalance remained about 23% (20 inner iterations)
+    and 20% (80 inner iterations). These runs do not establish mass conservation
+    or physiological validity; conservative boundary-flux extraction and mesh/
+    boundary-condition verification remain open.
     This establishes execution/output compatibility, not patient CFD accuracy
     or periodic convergence. See `docs/NATIVE_CFD.md` for startup and rollback.
 11. Expert-reference Dice/HD95, observer repeatability and CFD sensitivity runs
