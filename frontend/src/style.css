@@ -966,3 +966,26 @@ dialog.segmentation-dialog {
   height: 5px;
   border-radius: 50%;
 }
+
+.path-wall-status .segment-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.path-wall-status .segment-toggle input[type="checkbox"] {
+  margin: 0;
+  width: 11px;
+  height: 11px;
+}
+.path-wall-status .segment-toggle input[type="number"] {
+  width: 42px;
+  padding: 1px 3px;
+  font-size: 9px;
+}
+.path-wall-status .segment-toggle i {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}

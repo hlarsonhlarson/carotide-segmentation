@@ -2,15 +2,25 @@ import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import {
+  labelVesselSegments,
   scenePoint,
+  vesselSegmentNames,
+  vesselSegments,
   wallGeometry,
   type DisplayFlips,
   type SegmentationPoint,
+  type VesselSegment,
 } from "./segmentationGeometry";
 export const branches = ["cca_ica", "cca_eca"];
 export const branchColors: Record<string, string> = {
   cca_ica: "#f21c29",
   cca_eca: "#00ffff",
+};
+export const segmentColors: Record<VesselSegment, string> = {
+  cca: "#ffa726",
+  bifurcation: "#ce93d8",
+  ica: branchColors.cca_ica,
+  eca: branchColors.cca_eca,
 };
 const zero = [0, 0, 0];
 type Runtime = {
@@ -54,6 +64,15 @@ export function PathPreview({
   const host = useRef<HTMLDivElement>(null);
   const runtime = useRef<Runtime | null>(null);
   const [error, setError] = useState("");
+  const [visible, setVisible] = useState<Record<VesselSegment, boolean>>(
+    { cca: true, bifurcation: true, ica: true, eca: true });
+  const [bifurcationMm, setBifurcationMm] = useState(10);
+  const labels = labelVesselSegments(
+    segmentations.cca_ica || [], segmentations.cca_eca || [], bifurcationMm);
+  const sectionCounts = vesselSegments.map(segment =>
+    branches.reduce((n, b) => n + (labels[b as "cca_ica" | "cca_eca"] || [])
+      .filter((label, i) => label === segment &&
+        i >= (b === "cca_eca" ? labels.shared.cca_eca : 0)).length, 0));
   const count = branches.reduce(
     (n, b) => n + (points[side + ":" + b]?.length || 0),
     0,
@@ -222,22 +241,31 @@ export function PathPreview({
         dot.position.copy(voxel(p));
         view.group.add(dot);
       }
-      const wall = wallGeometry(segmentations[branch] || [], world);
-      if (wall.segments)
-        view.group.add(
-          new THREE.Mesh(
-            wall.geometry,
-            new THREE.MeshStandardMaterial({
-              color: branchColors[branch],
-              transparent: true,
-              opacity: 0.5,
-              depthWrite: false,
-              side: THREE.DoubleSide,
-              roughness: 0.65,
-            }),
-          ),
-        );
-      else wall.geometry.dispose();
+      const series = segmentations[branch] || [];
+      const branchLabels = labels[branch as "cca_ica" | "cca_eca"];
+      // The common CCA is in both series; draw it once, from the ICA series.
+      const skip = branch === "cca_eca" ? labels.shared.cca_eca : 0;
+      for (const segment of vesselSegments) {
+        if (!visible[segment]) continue;
+        // Interval i (sections i..i+1) takes the label of its distal section.
+        const wall = wallGeometry(series, world, (i) =>
+          i + 1 >= skip && branchLabels[i + 1] === segment);
+        if (wall.segments)
+          view.group.add(
+            new THREE.Mesh(
+              wall.geometry,
+              new THREE.MeshStandardMaterial({
+                color: segmentColors[segment],
+                transparent: true,
+                opacity: 0.55,
+                depthWrite: false,
+                side: THREE.DoubleSide,
+                roughness: 0.65,
+              }),
+            ),
+          );
+        else wall.geometry.dispose();
+      }
     }
     view.updateClipping();
     if (
@@ -262,6 +290,8 @@ export function PathPreview({
     segmentations,
     count,
     contourCount,
+    visible,
+    bifurcationMm,
   ]);
 
   return (
@@ -284,11 +314,27 @@ export function PathPreview({
       <div className="path-wall-status" role="status">
         {branches.map((branch, i) => (
           <span key={branch}>
-            <i style={{ background: branchColors[branch] }} />
             {branch === "cca_ica" ? "ICA" : "ECA"}: {wallCounts[i]} участков
             стенки
           </span>
         ))}
+        {vesselSegments.map((segment, i) => (
+          <label key={segment} className="segment-toggle">
+            <input type="checkbox" checked={visible[segment]}
+              onChange={(e) => setVisible({ ...visible, [segment]: e.target.checked })} />
+            <i style={{ background: segmentColors[segment] }} />
+            {vesselSegmentNames[segment]}: {sectionCounts[i]} сеч.
+          </label>
+        ))}
+        {labels.split ? (
+          <label className="segment-toggle">
+            Бифуркация ±
+            <input type="number" min={0} max={30} step={1} value={bifurcationMm}
+              onChange={(e) => setBifurcationMm(Math.max(0, +e.target.value || 0))} /> мм
+          </label>
+        ) : (
+          <span>Развилка не найдена: нужны обе ветви с общим началом в ОСА</span>
+        )}
       </div>
       <small className="preview-footer">Вращение · масштаб · перемещение</small>
     </section>

@@ -6,6 +6,7 @@ import {
   scenePoint,
   selectedRing,
   wallGeometry,
+  labelVesselSegments,
   type SegmentationPoint,
 } from "./segmentationGeometry";
 const point = (z: number, radius = 2): SegmentationPoint => ({
@@ -118,5 +119,34 @@ describe("segmentation wall preview", () => {
       coronal: { x: false, y: true },
     });
     expect(p.toArray()).toEqual([3, -1, 2]);
+  });
+});
+
+describe("vessel segment labels", () => {
+  // Shared CCA along z 0..40 mm, then ICA bends to +y and ECA to -y.
+  const at = (z: number, y: number): SegmentationPoint => ({ point_mm: [z, y, 0], tangent_mm: [1, 0, 0] });
+  const cca = Array.from({ length: 9 }, (_, i) => at(i * 5, 0));
+  const ica = [...cca, ...Array.from({ length: 6 }, (_, i) => at(40 + (i + 1) * 4, (i + 1) * 3))];
+  const eca = [...cca, ...Array.from({ length: 5 }, (_, i) => at(40 + (i + 1) * 4, -(i + 1) * 3))];
+
+  it("splits shared CCA, bifurcation zone and distal branches", () => {
+    const labels = labelVesselSegments(ica, eca, 10);
+    expect(labels.split).toBe(true);
+    expect(labels.cca_ica.slice(0, 6)).toEqual(Array(6).fill("cca"));
+    expect(labels.cca_ica.slice(6, 10)).toEqual(Array(4).fill("bifurcation"));
+    expect(labels.cca_ica.at(-1)).toBe("ica");
+    expect(labels.cca_eca.at(-1)).toBe("eca");
+    expect(labels.cca_eca.slice(0, 6)).toEqual(labels.cca_ica.slice(0, 6));
+  });
+
+  it("keeps branch labels when the split is unknown", () => {
+    expect(labelVesselSegments(ica, []).cca_ica.every(l => l === "ica")).toBe(true);
+    const apart = eca.map(p => ({ ...p, point_mm: [p.point_mm[0], p.point_mm[1] + 20, 0] }));
+    expect(labelVesselSegments(ica, apart).split).toBe(false);
+  });
+
+  it("draws only the requested intervals", () => {
+    const series = [0, 1, 2, 3].map(z => point(z));
+    expect(wallGeometry(series, convert, i => i !== 1).segments).toBe(2);
   });
 });

@@ -106,6 +106,8 @@ export function alignRing(ring: THREE.Vector3[], reference: THREE.Vector3[]) {
 export function wallGeometry(
   points: SegmentationPoint[],
   convert: (p: number[]) => THREE.Vector3,
+  // Interval i joins sections i and i+1; omit to draw every interval.
+  includeInterval?: (i: number) => boolean,
 ) {
   const rings = points.map((p) =>
     resampleRing((p.contour_mm || []).map(convert)),
@@ -116,6 +118,7 @@ export function wallGeometry(
   for (let i = 0; i < rings.length - 1; i++) {
     const a = rings[i];
     if (!a.length || !rings[i + 1].length) continue;
+    if (includeInterval && !includeInterval(i)) continue;
     const b = alignRing(rings[i + 1], a),
       n = a.length,
       base = vertices.length / 3;
@@ -181,3 +184,82 @@ export type SegmentationChange = (
   branch: string,
   points: SegmentationPoint[],
 ) => void;
+
+export type VesselSegment = "cca" | "bifurcation" | "ica" | "eca";
+export const vesselSegments: VesselSegment[] = ["cca", "bifurcation", "ica", "eca"];
+export const vesselSegmentNames: Record<VesselSegment, string> = {
+  cca: "ОСА", bifurcation: "Бифуркация", ica: "ВСА", eca: "НСА",
+};
+
+const SHARED_TOLERANCE_MM = 1.0;
+export type VesselLabels = {
+  cca_ica: VesselSegment[];
+  cca_eca: VesselSegment[];
+  split: boolean;
+  // Leading sections that lie on the other branch's path (the common CCA).
+  shared: { cca_ica: number; cca_eca: number };
+};
+
+function arcLengths(points: SegmentationPoint[]) {
+  const arc = [0];
+  for (let i = 1; i < points.length; i++) {
+    const [a, b] = [points[i - 1].point_mm, points[i].point_mm];
+    arc.push(arc[i - 1] + Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]));
+  }
+  return arc;
+}
+
+function distanceToPolyline(p: number[], line: SegmentationPoint[]) {
+  let best = Infinity;
+  for (let i = 0; i < line.length; i++) {
+    const a = line[i].point_mm;
+    const b = line[Math.min(i + 1, line.length - 1)].point_mm;
+    const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    const len2 = ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2;
+    const t = len2 > 0 ? Math.max(0, Math.min(1, (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len2)) : 0;
+    best = Math.min(best, Math.hypot(ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2]));
+  }
+  return best;
+}
+
+/**
+ * Label every section of both branch series as CCA, bifurcation, ICA or ECA.
+ *
+ * Both series start in the CCA. Their shared run (each section within 1 mm of
+ * the other branch's path) is the CCA; the split is where they part. Sections
+ * within `bifurcationMm` of the split along each path form the bifurcation
+ * zone; distal sections belong to that branch's own artery. With only one
+ * branch the split is unknown, so its sections keep the branch's label.
+ * This is geometric bookkeeping along the operator's paths, not anatomy
+ * detected from the image.
+ */
+export function labelVesselSegments(
+  ica: SegmentationPoint[],
+  eca: SegmentationPoint[],
+  bifurcationMm = 10,
+): VesselLabels {
+  const own = (n: number, label: VesselSegment) => Array<VesselSegment>(n).fill(label);
+  const unknown = { cca_ica: own(ica.length, "ica"), cca_eca: own(eca.length, "eca"), split: false,
+                    shared: { cca_ica: 0, cca_eca: 0 } };
+  if (!ica.length || !eca.length) return unknown;
+  const label = (series: SegmentationPoint[], other: SegmentationPoint[], distal: VesselSegment) => {
+    let shared = 0;
+    while (shared < series.length &&
+      distanceToPolyline(series[shared].point_mm, other) <= SHARED_TOLERANCE_MM) shared++;
+    if (shared === 0 || shared === series.length) return null;
+    const arc = arcLengths(series);
+    const split = arc[shared - 1];
+    return {
+      shared,
+      labels: series.map((_, i): VesselSegment => {
+        if (Math.abs(arc[i] - split) <= bifurcationMm) return "bifurcation";
+        return i < shared ? "cca" : distal;
+      }),
+    };
+  };
+  const a = label(ica, eca, "ica"), b = label(eca, ica, "eca");
+  if (!a || !b) return unknown;
+  return { cca_ica: a.labels, cca_eca: b.labels, split: true,
+           shared: { cca_ica: a.shared, cca_eca: b.shared } };
+}
