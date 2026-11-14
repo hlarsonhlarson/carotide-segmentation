@@ -103,15 +103,22 @@ export function alignRing(ring: THREE.Vector3[], reference: THREE.Vector3[]) {
 
 // Match the native preview: one merged ribbon mesh; never bridge an
 // unsegmented section. This preview is independent of the final CFD mesh.
+export function wallRings(
+  points: SegmentationPoint[],
+  convert: (p: number[]) => THREE.Vector3,
+) {
+  return points.map((p) => resampleRing((p.contour_mm || []).map(convert)));
+}
+
 export function wallGeometry(
   points: SegmentationPoint[],
   convert: (p: number[]) => THREE.Vector3,
   // Interval i joins sections i and i+1; omit to draw every interval.
   includeInterval?: (i: number) => boolean,
+  // Rings from wallRings(), when one series is drawn in several parts.
+  precomputed?: THREE.Vector3[][],
 ) {
-  const rings = points.map((p) =>
-    resampleRing((p.contour_mm || []).map(convert)),
-  );
+  const rings = precomputed ?? wallRings(points, convert);
   const vertices: number[] = [],
     indices: number[] = [];
   let segments = 0;
@@ -192,6 +199,8 @@ export const vesselSegmentNames: Record<VesselSegment, string> = {
 };
 
 const SHARED_TOLERANCE_MM = 1.0;
+const SHARED_RADIUS_FRACTION = 0.5;
+const MAX_EXCURSION = 2;
 export type VesselLabels = {
   cca_ica: VesselSegment[];
   cca_eca: VesselSegment[];
@@ -226,8 +235,9 @@ function distanceToPolyline(p: number[], line: SegmentationPoint[]) {
 /**
  * Label every section of both branch series as CCA, bifurcation, ICA or ECA.
  *
- * Both series start in the CCA. Their shared run (each section within 1 mm of
- * the other branch's path) is the CCA; the split is where they part. Sections
+ * Both series start in the CCA. Their shared run (sections within half the
+ * lumen radius, at least 1 mm, of the other branch's path, allowing brief
+ * excursions) is the CCA; the split is where they part. Sections
  * within `bifurcationMm` of the split along each path form the bifurcation
  * zone; distal sections belong to that branch's own artery. With only one
  * branch the split is unknown, so its sections keep the branch's label.
@@ -244,9 +254,18 @@ export function labelVesselSegments(
                     shared: { cca_ica: 0, cca_eca: 0 } };
   if (!ica.length || !eca.length) return unknown;
   const label = (series: SegmentationPoint[], other: SegmentationPoint[], distal: VesselSegment) => {
-    let shared = 0;
-    while (shared < series.length &&
-      distanceToPolyline(series[shared].point_mm, other) <= SHARED_TOLERANCE_MM) shared++;
+    // Two independently traced paths wander inside the same CCA lumen, so
+    // the tolerance scales with the section radius, and a short excursion
+    // (up to MAX_EXCURSION sections) does not end the common run.
+    let shared = 0, outside = 0;
+    for (let i = 0; i < series.length; i++) {
+      const tolerance = Math.max(SHARED_TOLERANCE_MM,
+        SHARED_RADIUS_FRACTION * (series[i].radius_mm ?? 0));
+      if (distanceToPolyline(series[i].point_mm, other) <= tolerance) {
+        shared = i + 1;
+        outside = 0;
+      } else if (++outside > MAX_EXCURSION) break;
+    }
     if (shared === 0 || shared === series.length) return null;
     const arc = arcLengths(series);
     const split = arc[shared - 1];

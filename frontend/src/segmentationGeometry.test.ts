@@ -139,6 +139,18 @@ describe("vessel segment labels", () => {
     expect(labels.cca_eca.slice(0, 6)).toEqual(labels.cca_ica.slice(0, 6));
   });
 
+  it("tolerates two traces wandering inside one CCA lumen", () => {
+    const wobble = ica.map((p, i) => i < 9
+      ? { ...p, radius_mm: 3.6, point_mm: [p.point_mm[0], i === 2 ? 2.4 : (i % 2 ? 1.5 : -1.5), 0] }
+      : p);
+    // Real sections carry their lumen radius on both branches.
+    const ecaR = eca.map((p, i) => (i < 9 ? { ...p, radius_mm: 3.6 } : p));
+    const labels = labelVesselSegments(wobble, ecaR, 10);
+    expect(labels.split).toBe(true);
+    expect(labels.shared.cca_ica).toBe(9);
+    expect(labels.cca_ica[0]).toBe("cca");
+  });
+
   it("keeps branch labels when the split is unknown", () => {
     expect(labelVesselSegments(ica, []).cca_ica.every(l => l === "ica")).toBe(true);
     const apart = eca.map(p => ({ ...p, point_mm: [p.point_mm[0], p.point_mm[1] + 20, 0] }));

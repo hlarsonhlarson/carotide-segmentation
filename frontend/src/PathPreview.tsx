@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import {
@@ -7,6 +7,7 @@ import {
   vesselSegmentNames,
   vesselSegments,
   wallGeometry,
+  wallRings,
   type DisplayFlips,
   type SegmentationPoint,
   type VesselSegment,
@@ -30,6 +31,7 @@ type Runtime = {
   updateClipping: () => void;
   pointCount: number;
   contourCount: number;
+  visibleKey: string;
   framed: boolean;
 };
 function clear(group: THREE.Group) {
@@ -67,8 +69,14 @@ export function PathPreview({
   const [visible, setVisible] = useState<Record<VesselSegment, boolean>>(
     { cca: true, bifurcation: true, ica: true, eca: true });
   const [bifurcationMm, setBifurcationMm] = useState(10);
-  const labels = labelVesselSegments(
-    segmentations.cca_ica || [], segmentations.cca_eca || [], bifurcationMm);
+  // O(sections²) distance checks: recompute only when the series change,
+  // not on every render.
+  const labels = useMemo(
+    () => labelVesselSegments(
+      segmentations.cca_ica || [], segmentations.cca_eca || [], bifurcationMm),
+    [segmentations, bifurcationMm],
+  );
+  const visibleKey = vesselSegments.filter((segment) => visible[segment]).join(",");
   const sectionCounts = vesselSegments.map(segment =>
     branches.reduce((n, b) => n + (labels[b as "cca_ica" | "cca_eca"] || [])
       .filter((label, i) => label === segment &&
@@ -128,8 +136,16 @@ export function PathPreview({
     scene.add(light);
     const group = new THREE.Group();
     scene.add(group);
+    // Frame the visible walls when there are any; otherwise the whole path.
+    const subject = () => {
+      const box = new THREE.Box3();
+      group.children.forEach((child) => {
+        if (child.userData.wall) box.expandByObject(child);
+      });
+      return box.isEmpty() ? new THREE.Box3().setFromObject(group) : box;
+    };
     const bounds = () => {
-      const box = new THREE.Box3().setFromObject(group);
+      const box = subject();
       return box.isEmpty()
         ? new THREE.Sphere(new THREE.Vector3(), 10)
         : box.expandByScalar(1).getBoundingSphere(new THREE.Sphere());
@@ -146,7 +162,7 @@ export function PathPreview({
     };
     const fit = () => {
       const sphere = bounds();
-      const box = new THREE.Box3().setFromObject(group);
+      const box = subject();
       const direction = new THREE.Vector3(0.35, 0.1, 1).normalize();
       const right = new THREE.Vector3(0, 1, 0).cross(direction).normalize();
       const up = direction.clone().cross(right);
@@ -185,6 +201,7 @@ export function PathPreview({
       updateClipping,
       pointCount: 0,
       contourCount: 0,
+      visibleKey: "",
       framed: false,
     };
     const resize = () => {
@@ -245,14 +262,15 @@ export function PathPreview({
       const branchLabels = labels[branch as "cca_ica" | "cca_eca"];
       // The common CCA is in both series; draw it once, from the ICA series.
       const skip = branch === "cca_eca" ? labels.shared.cca_eca : 0;
+      const rings = wallRings(series, world);
       for (const segment of vesselSegments) {
         if (!visible[segment]) continue;
         // Interval i (sections i..i+1) takes the label of its distal section.
         const wall = wallGeometry(series, world, (i) =>
-          i + 1 >= skip && branchLabels[i + 1] === segment);
+          i + 1 >= skip && branchLabels[i + 1] === segment, rings);
         if (wall.segments)
           view.group.add(
-            new THREE.Mesh(
+            Object.assign(new THREE.Mesh(
               wall.geometry,
               new THREE.MeshStandardMaterial({
                 color: segmentColors[segment],
@@ -262,7 +280,7 @@ export function PathPreview({
                 side: THREE.DoubleSide,
                 roughness: 0.65,
               }),
-            ),
+            ), { userData: { wall: true } }),
           );
         else wall.geometry.dispose();
       }
@@ -272,13 +290,15 @@ export function PathPreview({
       count &&
       (!view.framed ||
         view.pointCount !== count ||
-        view.contourCount !== contourCount)
+        view.contourCount !== contourCount ||
+        view.visibleKey !== visibleKey)
     ) {
       view.fit();
       view.framed = true;
     }
     view.pointCount = count;
     view.contourCount = contourCount;
+    view.visibleKey = visibleKey;
     view.render();
   }, [
     paths,
@@ -311,32 +331,39 @@ export function PathPreview({
       {!count && (
         <div className="preview-hint">Добавьте точки пути на срезах</div>
       )}
-      <div className="path-wall-status" role="status">
-        {branches.map((branch, i) => (
-          <span key={branch}>
-            {branch === "cca_ica" ? "ICA" : "ECA"}: {wallCounts[i]} участков
-            стенки
-          </span>
-        ))}
+      <div
+        className="path-wall-status"
+        role="status"
+        title={branches
+          .map((branch, i) => `${branch === "cca_ica" ? "ICA" : "ECA"}: ${wallCounts[i]} участков стенки`)
+          .join("\n") + "\nЛевая кнопка — вращение, правая — масштаб, средняя — перемещение"}
+      >
         {vesselSegments.map((segment, i) => (
-          <label key={segment} className="segment-toggle">
-            <input type="checkbox" checked={visible[segment]}
-              onChange={(e) => setVisible({ ...visible, [segment]: e.target.checked })} />
+          <button
+            key={segment}
+            type="button"
+            className="segment-chip"
+            aria-pressed={visible[segment]}
+            title={`${visible[segment] ? "Скрыть" : "Показать"}: ${vesselSegmentNames[segment]}, ${sectionCounts[i]} сечений`}
+            onClick={() => setVisible({ ...visible, [segment]: !visible[segment] })}
+          >
             <i style={{ background: segmentColors[segment] }} />
-            {vesselSegmentNames[segment]}: {sectionCounts[i]} сеч.
-          </label>
+            {vesselSegmentNames[segment] === "Бифуркация" ? "Бифурк." : vesselSegmentNames[segment]}
+            <b>{sectionCounts[i]}</b>
+          </button>
         ))}
         {labels.split ? (
-          <label className="segment-toggle">
-            Бифуркация ±
+          <label className="segment-zone" title="Зона бифуркации вдоль пути от развилки">
+            ±
             <input type="number" min={0} max={30} step={1} value={bifurcationMm}
-              onChange={(e) => setBifurcationMm(Math.max(0, +e.target.value || 0))} /> мм
+              aria-label="Зона бифуркации, мм"
+              onChange={(e) => setBifurcationMm(Math.max(0, +e.target.value || 0))} />
+            мм
           </label>
         ) : (
-          <span>Развилка не найдена: нужны обе ветви с общим началом в ОСА</span>
+          <span className="segment-zone">Развилка не найдена</span>
         )}
       </div>
-      <small className="preview-footer">Вращение · масштаб · перемещение</small>
     </section>
   );
 }

@@ -967,25 +967,56 @@ dialog.segmentation-dialog {
   border-radius: 50%;
 }
 
-.path-wall-status .segment-toggle {
+.path-wall-status {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 4px 6px 6px;
+}
+.path-wall-status .segment-chip {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+  padding: 2px 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text, #dbe4ef);
+  font-size: 9px;
+  line-height: 1.2;
+  white-space: nowrap;
   cursor: pointer;
 }
-.path-wall-status .segment-toggle input[type="checkbox"] {
-  margin: 0;
-  width: 11px;
-  height: 11px;
+.path-wall-status .segment-chip[aria-pressed="false"] {
+  opacity: 0.4;
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.12);
 }
-.path-wall-status .segment-toggle input[type="number"] {
-  width: 42px;
-  padding: 1px 3px;
-  font-size: 9px;
-}
-.path-wall-status .segment-toggle i {
+.path-wall-status .segment-chip i {
   flex-shrink: 0;
   width: 7px;
   height: 7px;
   border-radius: 50%;
+}
+.path-wall-status .segment-chip b {
+  margin-left: auto;
+  font-weight: 500;
+  color: var(--dim);
+}
+.path-wall-status .segment-zone {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 0;
+  font-size: 9px;
+}
+.path-wall-status .segment-zone input {
+  width: 38px;
+  margin: 0;
+  padding: 1px 3px;
+  font-size: 9px;
 }
