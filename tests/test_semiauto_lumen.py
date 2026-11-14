@@ -269,6 +269,33 @@ def test_orientation_uses_physical_points():
     assert labels[32, 20, 20] == 2
 
 
+def test_four_points_keep_the_carotid_and_drop_a_touching_vein():
+    image, array = _image((90, 60, 50), spacing_xyz=(1.0, 1.0, 1.0))
+    _fill_capsule(array, image, (20, 20, 8), (20, 20, 40), 3.2, LUMEN)
+    _fill_capsule(array, image, (20, 20, 40), (20, 20, 78), 2.2, LUMEN)
+    _fill_path(array, image, [(20, 20, 48), (20, 20, 54), (20, 20, 60)], 1.2, LUMEN)
+    _fill_capsule(array, image, (20, 20, 40), (20, 42, 46), 1.8, LUMEN)
+    _fill_capsule(array, image, (20, 42, 46), (20, 52, 50), 1.6, LUMEN)
+    # Centre 6.2 mm from the CCA axis, so the lumens touch and intensity growth crosses.
+    _fill_capsule(array, image, (26.2, 20, 12), (26.2, 20, 70), 3.2, VEIN)
+    built = _write(array, image)
+    result = segment_lumen(
+        built, (20, 20, 18), (20, 20, 68),
+        eca_point=(20, 34, 44), bifurcation_point=(20, 22, 40),
+        params=LumenParams(max_radius_factor=2.2),
+    )
+    labels = sitk.GetArrayFromImage(result.labels)
+    component = sitk.GetArrayFromImage(result.component)
+    assert result.status in ("ok", "needs_review"), result.requests
+    assert labels[physical_to_voxel(built, (20, 20, 18))] == 1
+    assert labels[physical_to_voxel(built, (20, 20, 68))] == 2
+    assert labels[physical_to_voxel(built, (20, 34, 44))] == 3
+    assert not component[physical_to_voxel(built, (26.2, 20, 30))]
+    assert labels[physical_to_voxel(built, (20, 48, 49))] != 3
+    areas = [sample["area_mm2"] for sample in result.samples if sample["label"] == 2 and sample["from_end_mm"] >= 3]
+    assert areas and min(areas) < 0.7 * np.median(areas)
+
+
 def test_ambiguous_eca_waits_for_a_third_point():
     image, array = _image((80, 50, 70), spacing_xyz=(1, 1, 1))
     _fill_capsule(array, image, (25, 25, 10), (25, 25, 40), 3.0, LUMEN)

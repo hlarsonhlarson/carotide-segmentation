@@ -6,7 +6,9 @@ cutting planes. Example::
     python -m carotid_seg.semiauto.cli \\
         --image /path/to/cta.nii.gz \\
         --cca 12.0 -140.0 80.0 \\
+        --bifurcation 14.0 -80.0 120.0 \\
         --ica 18.0 -20.0 160.0 \\
+        --eca 22.0 -70.0 125.0 \\
         --out /path/to/review
 
 A DICOM series directory is accepted as ``--image``. The run writes the lumen,
@@ -46,7 +48,10 @@ def main(argv=None):
     parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--cca", required=True, nargs=3, type=float, metavar=("X", "Y", "Z"))
     parser.add_argument("--ica", required=True, nargs=3, type=float, metavar=("X", "Y", "Z"))
-    parser.add_argument("--eca", nargs=3, type=float, metavar=("X", "Y", "Z"))
+    parser.add_argument("--bifurcation", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                        help="Просвет в бифуркации. Вместе с --eca оставляет только путь через четыре точки.")
+    parser.add_argument("--eca", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                        help="Конец НСА. Вместе с --bifurcation задаёт маршрут.")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--vesselness", action="store_true",
                         help="Только пометить сомнительную границу. Маску не меняет.")
@@ -54,7 +59,12 @@ def main(argv=None):
 
     image = read_image(args.image)
     params = LumenParams(use_vesselness=args.vesselness)
-    result = segment_lumen(image, _point(args.cca), _point(args.ica), None if args.eca is None else _point(args.eca), params)
+    result = segment_lumen(
+        image, _point(args.cca), _point(args.ica),
+        None if args.eca is None else _point(args.eca),
+        bifurcation_point=None if args.bifurcation is None else _point(args.bifurcation),
+        params=params,
+    )
     args.out.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(result.lumen, str(args.out / "lumen.nii.gz"))
     sitk.WriteImage(result.labels, str(args.out / "labels.nii.gz"))

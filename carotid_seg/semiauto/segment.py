@@ -5,10 +5,12 @@ and, if the ECA is ambiguous, a third point inside the proximal ECA. The
 points identify the vessel. They are not the ends of the segments.
 
 The lumen is the face-connected component whose intensity matches the local
-contrast around those points. Plaque, calcium, vein and bone stay out because
-they fail that local comparison or are not connected, not because of a fixed
-HU gate. Vesselness is not used to grow the mask. Centerlines and CCA/ICA/ECA
-labels are derived only after the mask exists.
+contrast around those points. With a bifurcation point and an ECA end, the
+kept lumen is only the cross-section along the path through the four points,
+so a parallel vein of the same brightness is left out. Plaque, calcium and
+bone stay out because they fail the local comparison. Vesselness is not used
+to grow the mask. Centerlines and CCA/ICA/ECA labels are derived only after
+the mask exists.
 
 This does not claim clinical accuracy. Synthetic checks live in
 ``tests/test_semiauto_lumen.py``. A real series still needs visual review of
@@ -21,6 +23,7 @@ import SimpleITK as sitk
 
 from .appearance import fit_seed_model
 from .branches import label_branches
+from .corridor import restrict_to_route
 from .geometry import image_from_array, physical_to_voxel
 from .grow import component_contains_both, grow_lumen, paint
 from .params import LumenParams
@@ -87,18 +90,24 @@ def _mark_bloom(array, accepted, rejected, models, params, uncertainty):
             uncertainty[zyx] |= BLOOM
 
 
-def segment_lumen(image: sitk.Image, cca_point, ica_point, eca_point=None, params: LumenParams | None = None,
-                  reference: sitk.Image | None = None) -> SegmentationResult:
+def segment_lumen(image: sitk.Image, cca_point, ica_point, eca_point=None, *, bifurcation_point=None,
+                  params: LumenParams | None = None, reference: sitk.Image | None = None) -> SegmentationResult:
     """Segment one cervical carotid.
 
-    ``cca_point``, ``ica_point`` and optional ``eca_point`` are physical (x, y, z)
-    millimetres in the same frame as ``image``. Outputs copy that geometry.
+    Points are physical (x, y, z) millimetres in the same frame as ``image``.
+    ``cca_point`` lies in tubular CCA and ``ica_point`` in the cervical ICA,
+    proximal to the canal. ``bifurcation_point`` and ``eca_point`` together
+    name the split and the ECA end; the lumen is then limited to that route.
+    Outputs copy the source geometry.
     """
     params = params or LumenParams()
     array = np.asarray(sitk.GetArrayFromImage(image), dtype=np.float32)
-    cca = fit_seed_model(image, array, cca_point, "cca", params)
-    ica = fit_seed_model(image, array, ica_point, "ica", params)
-    models = [cca, ica]
+    named = [("cca", cca_point), ("ica", ica_point)]
+    if bifurcation_point is not None:
+        named.append(("bifurcation", bifurcation_point))
+    if eca_point is not None and bifurcation_point is not None:
+        named.append(("eca", eca_point))
+    models = [fit_seed_model(image, array, point, name, params) for name, point in named]
     failed = [model for model in models if not model.reliable]
     if failed:
         message = " ".join(model.message for model in failed)
@@ -107,7 +116,25 @@ def segment_lumen(image: sitk.Image, cca_point, ica_point, eca_point=None, param
     grown = grow_lumen(image, array, models, params)
     cca_voxel = physical_to_voxel(image, cca_point)
     ica_voxel = physical_to_voxel(image, ica_point)
-    connected = component_contains_both(grown.accepted, cca_voxel, ica_voxel)
+    route = bifurcation_point is not None and eca_point is not None
+    if route:
+        kept = restrict_to_route(
+            image, array, grown.accepted, models, params,
+            cca_voxel,
+            physical_to_voxel(image, bifurcation_point),
+            ica_voxel,
+            physical_to_voxel(image, eca_point),
+        )
+        if kept is None:
+            grown.accepted = set()
+        else:
+            grown.accepted = kept
+            grown.scores = {voxel: score for voxel, score in grown.scores.items() if voxel in kept}
+    connected = (
+        cca_voxel in grown.accepted
+        and ica_voxel in grown.accepted
+        and component_contains_both(grown.accepted, cca_voxel, ica_voxel)
+    )
     component = paint(array.shape, grown.accepted)
     uncertainty = np.zeros(array.shape, dtype=np.uint16)
     _mark_boundary(array, grown.accepted, grown.scores, params, uncertainty)
@@ -141,6 +168,8 @@ def segment_lumen(image: sitk.Image, cca_point, ica_point, eca_point=None, param
         _annotate_vesselness(array, component.astype(bool), uncertainty, params)
 
     labeled = label_branches(image, array, component.astype(bool), cca_voxel, ica_voxel, eca_point, models, params)
+    if route:
+        _claim_eca(labeled.labels, component.astype(bool), physical_to_voxel(image, eca_point), physical_to_voxel(image, bifurcation_point))
     uncertainty |= labeled.uncertainty
     requests.extend(labeled.requests)
     lumen = (labeled.labels > 0).astype(np.uint8)
@@ -161,6 +190,28 @@ def segment_lumen(image: sitk.Image, cca_point, ica_point, eca_point=None, param
         image_from_array(component, image),
         qa, models, labeled.samples,
     )
+
+
+def _claim_eca(labels, mask, eca_voxel, bifurcation_voxel):
+    """The skeleton stop can leave the operator's ECA end unlabeled. Fill only unlabeled lumen."""
+    if eca_voxel is None or not mask[eca_voxel] or labels[eca_voxel] in (1, 2):
+        return
+    if bifurcation_voxel is not None and mask[bifurcation_voxel]:
+        labels[bifurcation_voxel] = 1
+    labels[eca_voxel] = 3
+    stack = [eca_voxel]
+    seen = {eca_voxel}
+    while stack:
+        z, y, x = stack.pop()
+        for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+            nxt = (z + dz, y + dy, x + dx)
+            if nxt in seen or not (0 <= nxt[0] < mask.shape[0] and 0 <= nxt[1] < mask.shape[1] and 0 <= nxt[2] < mask.shape[2]):
+                continue
+            if not mask[nxt] or labels[nxt] in (1, 2):
+                continue
+            seen.add(nxt)
+            labels[nxt] = 3
+            stack.append(nxt)
 
 
 def _annotate_vesselness(array, mask, uncertainty, params: LumenParams):
