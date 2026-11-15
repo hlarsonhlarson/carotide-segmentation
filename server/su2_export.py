@@ -45,6 +45,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial import cKDTree
 import tetgen
 import vtk
 from vtk.util import numpy_support
@@ -205,6 +206,90 @@ def _fan_cap(loop_points_world):
     triangulator.Update()
     cap = vtk.vtkPolyData()
     cap.DeepCopy(triangulator.GetOutput())
+    return cap
+
+
+def _disc_cap(loop_points_world, edge_mm: float = GLOBAL_EDGE_SIZE_MM):
+    """Near-equilateral cap: interior nodes on a hexagonal grid (spacing
+    edge_mm) inside the loop's best-fit plane, joined to the loop by a
+    boundary-constrained Delaunay triangulation. A plain polygon
+    triangulation of a ~50-vertex loop is all long thin triangles across
+    the opening; the control volumes TetGen builds on them decouple
+    pressure and velocity at the inlet/outlet (a Poiseuille tube showed
+    the pressure noise concentrated there). Interior nodes follow the
+    loop's own out-of-plane waviness by inverse-distance weighting.
+    Returns None when the constrained triangulation does not reproduce
+    every boundary edge, so the caller can fall back."""
+    loop = np.asarray(loop_points_world, dtype=float)
+    n = len(loop)
+    centre = loop.mean(axis=0)
+    _, _, vt = np.linalg.svd(loop - centre)
+    e1, e2, normal = vt
+    uv = np.c_[(loop - centre) @ e1, (loop - centre) @ e2]
+    if np.sum(uv[:, 0] * np.roll(uv[:, 1], -1) - np.roll(uv[:, 0], -1) * uv[:, 1]) < 0:
+        # vtkDelaunay2D treats a clockwise constraint polygon as a hole.
+        e2, normal = -e2, -normal
+        uv[:, 1] *= -1
+    offset = (loop - centre) @ normal
+    # Hexagonal grid clipped to the polygon, kept away from its edges.
+    h = float(edge_mm)
+    lo, hi = uv.min(axis=0), uv.max(axis=0)
+    rows = np.arange(lo[1], hi[1] + h, h * np.sqrt(3) / 2)
+    cols = np.arange(lo[0], hi[0] + h, h)
+    gx = cols[None, :] + 0.5 * h * (np.arange(len(rows)) % 2)[:, None]
+    grid = np.column_stack([gx.ravel(), np.repeat(rows, len(cols))])
+    if len(grid):
+        a, b = uv, np.roll(uv, -1, axis=0)
+        x, y = grid[:, :1], grid[:, 1:]
+        crosses = ((a[:, 1] > y) != (b[:, 1] > y)) & (
+            x < (b[:, 0] - a[:, 0]) * (y - a[:, 1]) / np.where(b[:, 1] == a[:, 1], 1e-12, b[:, 1] - a[:, 1]) + a[:, 0])
+        inside = crosses.sum(axis=1) % 2 == 1
+        seg = b - a
+        t = np.clip(((grid[:, None, :] - a) * seg).sum(-1) / np.maximum((seg * seg).sum(-1), 1e-12), 0, 1)
+        dist = np.linalg.norm(grid[:, None, :] - (a + t[..., None] * seg), axis=-1).min(axis=1)
+        grid = grid[inside & (dist > 0.6 * h)]
+    pts2 = np.vstack([uv, grid]) if len(grid) else uv
+    vpts = vtk.vtkPoints()
+    vpts.SetData(numpy_support.numpy_to_vtk(np.column_stack([pts2, np.zeros(len(pts2))]), deep=True))
+    cloud = vtk.vtkPolyData()
+    cloud.SetPoints(vpts)
+    boundary = vtk.vtkPolyData()
+    boundary.SetPoints(vpts)
+    poly_cell = vtk.vtkCellArray()
+    poly_cell.InsertNextCell(n)
+    for i in range(n):
+        poly_cell.InsertCellPoint(i)
+    boundary.SetPolys(poly_cell)
+    delaunay = vtk.vtkDelaunay2D()
+    delaunay.SetInputData(cloud)
+    delaunay.SetSourceData(boundary)
+    delaunay.Update()
+    tri = delaunay.GetOutput()
+    if tri.GetNumberOfPolys() == 0:
+        return None
+    faces = numpy_support.vtk_to_numpy(tri.GetPolys().GetConnectivityArray()).reshape(-1, 3).astype(np.int64)
+    # Every loop edge must be a triangle edge, exactly once (watertight seam).
+    tri_edges = np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1)
+    edges, counts = np.unique(tri_edges, axis=0, return_counts=True)
+    loop_edges = np.sort(np.column_stack([np.arange(n), (np.arange(n) + 1) % n]), axis=1)
+    found = {tuple(e): c for e, c in zip(edges.tolist(), counts.tolist())}
+    if any(found.get(tuple(e), 0) != 1 for e in loop_edges.tolist()):
+        return None
+    if len(grid):
+        d = np.linalg.norm(grid[:, None, :] - uv[None], axis=-1)
+        w = 1.0 / np.maximum(d, 1e-9) ** 2
+        grid_offset = (w * offset).sum(axis=1) / w.sum(axis=1)
+        interior = centre + grid[:, :1] * e1 + grid[:, 1:] * e2 + grid_offset[:, None] * normal
+        pts3 = np.vstack([loop, interior])
+    else:
+        pts3 = loop
+    out_pts = vtk.vtkPoints()
+    out_pts.SetData(numpy_support.numpy_to_vtk(np.ascontiguousarray(pts3), deep=True))
+    cells = vtk.vtkCellArray()
+    cells.SetData(3, numpy_support.numpy_to_vtkIdTypeArray(faces.ravel().astype(np.int64), deep=True))
+    cap = vtk.vtkPolyData()
+    cap.SetPoints(out_pts)
+    cap.SetPolys(cells)
     return cap
 
 
@@ -380,31 +465,39 @@ def tag_surface_faces(poly, series_by_branch: dict):
         # has zero non-manifold edges. See _count_boundary_edges().
         return _count_nonmanifold_edges(p), _count_boundary_edges(p)
 
-    result = build(lambda idx: _fan_cap)
+    # Cap methods from best triangle quality to most robust: a loop whose
+    # cap leaves the merged surface non-manifold or open is downgraded one
+    # step (see _disc_cap, _fan_cap and _centroid_fan_cap for why each
+    # exists), the other caps keep their better method.
+    methods = [_disc_cap, _fan_cap, _centroid_fan_cap]
+    caps = {}
+
+    def cap_for(idx, lvl):
+        # Cached so a retry rebuilds only the downgraded cap; a method that
+        # cannot cap this loop (None) hands over to the next one.
+        while (idx, lvl) not in caps or caps[(idx, lvl)] is None:
+            if (idx, lvl) not in caps:
+                caps[(idx, lvl)] = methods[lvl](loops[idx])
+            if caps[(idx, lvl)] is None:
+                lvl += 1
+        return lvl
+
+    level = {idx: cap_for(idx, 0) for idx in assigned}
+    result = build(lambda idx: lambda loop: caps[(idx, level[idx])])
     n_bad = _defect_count(result)
-    if any(n_bad):
-        # _fan_cap (vtkContourTriangulator) left the merged surface
-        # non-manifold or non-watertight — CONFIRMED this can happen on a
-        # loop with real out-of-plane waviness even though the same
-        # loop's own boundary-edge adjacency is a clean simple cycle (not
-        # a bug in loop extraction). Retry only the specific loop(s)
-        # whose own points are implicated, using the more robust (if
-        # lower-quality) centroid fan instead — rather than
-        # un-conditionally downgrading every cap, which would reintroduce
-        # the thin-sliver failure mode _fan_cap was written to fix in the
-        # first place.
+    while any(n_bad):
         bad_pts = np.concatenate([_nonmanifold_points(result), _boundary_points(result)], axis=0)
-        retry_idx = set()
-        for idx in assigned:
-            loop_arr = np.asarray(loops[idx])
-            for bp in bad_pts:
-                if np.min(np.linalg.norm(loop_arr - bp, axis=1)) < 1.0:
-                    retry_idx.add(idx)
-                    break
-        result2 = build(lambda idx: _centroid_fan_cap if idx in retry_idx else _fan_cap)
-        n_bad2 = _defect_count(result2)
-        if n_bad2 <= n_bad:
-            result, n_bad = result2, n_bad2
+        implicated = {idx for idx in assigned
+                      if len(bad_pts) and cKDTree(np.asarray(loops[idx])).query(bad_pts)[0].min() < 1.0}
+        downgrade = {idx for idx in implicated if level[idx] < len(methods) - 1}
+        if not downgrade:
+            break
+        trial = {idx: cap_for(idx, level[idx] + 1) if idx in downgrade else level[idx] for idx in assigned}
+        candidate = build(lambda idx: lambda loop: caps[(idx, trial[idx])])
+        n_candidate = _defect_count(candidate)
+        level = trial
+        if n_candidate <= n_bad:
+            result, n_bad = candidate, n_candidate
 
     if any(n_bad):
         n_nonmanifold, n_open = n_bad
@@ -471,7 +564,7 @@ def _tetrahedralize(tagged_surface, global_edge_size_mm: float = GLOBAL_EDGE_SIZ
     tg = tetgen.TetGen(pts, faces, face_ids)
     try:
         nodes, elems, _attr, triface_markers = tg.tetrahedralize(
-            order=1, mindihedral=10, minratio=1.5, maxvolume=max_volume,
+            order=1, mindihedral=10, minratio=1.5, maxvolume=max_volume, fixedvolume=1,
         )
     except RuntimeError as exc:
         log.warning(
@@ -480,7 +573,7 @@ def _tetrahedralize(tagged_surface, global_edge_size_mm: float = GLOBAL_EDGE_SIZ
         )
         tg = tetgen.TetGen(pts, faces, face_ids)
         nodes, elems, _attr, triface_markers = tg.tetrahedralize(
-            order=1, maxvolume=max_volume,
+            order=1, maxvolume=max_volume, fixedvolume=1,
         )
 
     boundary_faces = np.asarray(tg.trifaces)

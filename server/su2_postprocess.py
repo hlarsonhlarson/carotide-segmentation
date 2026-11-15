@@ -6,12 +6,13 @@ shear index (OSI), relative residence time (RRT), and pressure — plus the
 wall/cap geometry stats (areas, diameters, branch lengths) a "sizes and
 volumes" panel needs.
 
-Field extraction follows the same convention the validated standalone
-pipeline's own extractor used (~/Desktop/SU2 Pipeline Code/shared/
-extract_generic.py): WSS magnitude [Pa] = 0.5 * |Skin_Friction_Coefficient|
-— SU2's own dimensional output under INC_NONDIM=DIMENSIONAL already scales
-this by density/velocity internally, and the 0.5 factor is this project's
-own established convention from real validated runs, not re-derived here.
+WSS [Pa] = Skin_Friction_Coefficient * q_ref (see skin_friction_scale_pa):
+SU2 divides wall shear by the reference dynamic pressure, which for the
+incompressible solver with INC_NONDIM=DIMENSIONAL is 0.5*rho*|v_init|^2,
+replaced by 1 when that is ~0 (CIncEulerSolver::SetReferenceValues). Our
+runs start from zero velocity, so Cf already is WSS in Pa. The earlier
+0.5*Cf convention halved every WSS; verified on a Poiseuille tube
+(|Cf| 0.20 Pa vs analytic 0.21 Pa).
 
 OSI (oscillatory shear index) and RRT (relative residence time) are
 standard derived hemodynamic metrics from the literature (CONFIRMED
@@ -105,6 +106,28 @@ def _flow_files_sorted(run_dir: Path):
     return list(zip(files, steps))
 
 
+def skin_friction_scale_pa(run_dir) -> float:
+    """Reference dynamic pressure SU2 divided wall shear by (Pa), read from
+    the run's own run.cfg; mirrors CIncEulerSolver::SetReferenceValues."""
+    cfg = Path(run_dir) / "run.cfg"
+    values = {}
+    if cfg.is_file():
+        for line in cfg.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("%"):
+                key, value = line.split("=", 1)
+                values[key.strip().upper()] = value.strip()
+    def vec(text):
+        return [float(v) for v in text.strip("() ").replace(",", " ").split()] if text else [0.0]
+    if values.get("INC_NONDIM", "INITIAL_VALUES").upper() in ("DIMENSIONAL", "INITIAL_VALUES"):
+        density = float(values.get("INC_DENSITY_INIT", 1.2229))
+        speed2 = sum(v * v for v in vec(values.get("INC_VELOCITY_INIT", "(1, 0, 0)")))
+    else:
+        density = float(values.get("INC_DENSITY_REF", 1.0))
+        speed2 = float(values.get("INC_VELOCITY_REF", 1.0)) ** 2
+    q = 0.5 * density * speed2
+    return q if q >= 1e-16 else 1.0
+
+
 def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float, on_frame=None):
     """Reads every flow_*.vtu snapshot SU2 wrote for this run and builds
     the wall-only surface (points in mm, triangles) plus per-frame WSS
@@ -135,6 +158,8 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
     reference_file = Path(run_dir) / "pressure_reference.json"
     pressure_reference = (float(json.loads(reference_file.read_text())["pressure_reference_pa"])
                           if reference_file.is_file() else 0.0)
+
+    cf_to_pa = skin_friction_scale_pa(run_dir)
 
     points_mm = None
     times_s = []
@@ -176,7 +201,7 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
         pressure_values = numpy_support.vtk_to_numpy(pressure_array)
         if cf.shape != (ug.GetNumberOfPoints(), 3) or pressure_values.shape != (ug.GetNumberOfPoints(),):
             raise ValueError(f"CFD frame {step} has invalid WSS or pressure dimensions")
-        wss_vec = (0.5 * cf[wall_vol_idx]).astype(np.float32)
+        wss_vec = (cf_to_pa * cf[wall_vol_idx]).astype(np.float32)
         pressure = (pressure_values[wall_vol_idx] + pressure_reference).astype(np.float32)
         if not np.isfinite(wss_vec).all() or not np.isfinite(pressure).all():
             raise ValueError(f"CFD frame {step} contains nonfinite wall fields")

@@ -8,9 +8,10 @@ export CAROTID_SU2_BIN="${CAROTID_SU2_BIN:-/Users/egor/su2-project/install/bin}"
 export CAROTID_MPI_PYTHON="${CAROTID_MPI_PYTHON:-/opt/homebrew/bin/python3.14}"
 export PATH="/opt/homebrew/bin:${PATH}"
 export PYTHONPATH="${CAROTID_SU2_BIN}${PYTHONPATH:+:$PYTHONPATH}"
-export OMPI_MCA_btl="${OMPI_MCA_btl:-self,tcp}"
-export OMPI_MCA_pml="${OMPI_MCA_pml:-ob1}"
-export OMPI_MCA_osc="${OMPI_MCA_osc:-sm}"
+# Shared-memory transport (the default btl) with the rdma one-sided component:
+# osc=sm hung in MPI_Win_create on macOS, and btl=tcp made every halo
+# exchange go through the network stack (~30x slower per iteration).
+export OMPI_MCA_osc="${OMPI_MCA_osc:-rdma}"
 export PMIX_MCA_gds="${PMIX_MCA_gds:-hash}"
 export CAROTID_DICOM_ROOT="${CAROTID_DICOM_ROOT:-/Users/egor/Desktop/CT Data}"
 export CAROTID_PROJECTS_ROOT="${CAROTID_PROJECTS_ROOT:-/Users/egor/Desktop/CT Data}"

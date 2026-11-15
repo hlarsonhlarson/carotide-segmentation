@@ -115,6 +115,29 @@ establish accuracy on patient CTA.
   not fixed by calibration. Nine sections from one patient are too few to
   generalize; repeat with more reference sections and operators.
 
+- CFD numerics checked on a steady Poiseuille tube (R 3 mm, 90 mm, Re ~90),
+  built by the app's own surface and mesh pipeline and, as a control, from an
+  analytic cylinder. Three defects were found and fixed:
+  1. WSS was half its true value everywhere. SU2 divides wall shear by the
+     reference dynamic pressure, which is 1 Pa for our dimensional runs with
+     zero initial velocity, so `Skin_Friction_Coefficient` already is WSS in
+     Pa; the old `0.5 * Cf` convention halved WSS, TAWSS and doubled RRT (OSI
+     is unaffected). `su2_postprocess.skin_friction_scale_pa` now follows
+     SU2's own rule from each run's `run.cfg`. Results computed before this
+     change must be post-processed again.
+  2. TetGen ignored the requested element size (`maxvolume` needs
+     `fixedvolume`), so volume meshes were ~6x coarser than 0.4 mm.
+  3. Inlet/outlet caps were a plain polygon triangulation: long thin
+     triangles whose control volumes decoupled pressure from velocity
+     (pressure gradient 47x the analytic value with first order; second
+     order did not converge). Caps are now near-equilateral discs
+     (`su2_export._disc_cap`), with the old methods as fallbacks.
+  With these, second-order convection (MUSCL + Venkatakrishnan), now the
+  default, gives dp/dx +19% and WSS -3% against Poiseuille on the app's own
+  tube mesh (+7% / -5% on the analytic mesh); first order overstated dp/dx
+  3-4x. The steady tube does not test pulsatile timing or the Windkessel
+  outlets.
+
 ## Remaining implementation and validation
 
 0. Complete migration of legacy annotations/surfaces to LPS; resampling or

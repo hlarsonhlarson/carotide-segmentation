@@ -128,7 +128,11 @@ def main():
     id_cca = marker_ids.get("cca_inlet", -1)
     id_ica = marker_ids.get("ica_outlet", -1)
     id_eca = marker_ids.get("eca_outlet", -1)
-    if min(id_cca, id_ica, id_eca) < 0:
+    # GetMarkerIndices lists only the markers this rank's partition touches;
+    # with several ranks a boundary lives on some of them. Every use below
+    # checks the local id, so only require each marker somewhere.
+    present = comm.allreduce(np.array([id_cca >= 0, id_ica >= 0, id_eca >= 0], dtype=np.int64), op=MPI.SUM)
+    if (present == 0).any():
         raise ValueError("The pulsatile runner requires CCA inlet and ICA/ECA outlet markers")
 
     prim_idx = driver.GetPrimitiveIndices()
