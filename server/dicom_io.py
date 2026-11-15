@@ -20,6 +20,7 @@ classic multi-file series into many files and leaves a Siemens enhanced
 file as its own one-file series) and lets the caller pick one explicitly,
 rather than guessing.
 """
+import logging
 import tempfile
 from pathlib import Path
 
@@ -183,13 +184,63 @@ def _validate_multiframe_geometry(ds):
     _validate_stack_geometry(headers)
 
 
+log = logging.getLogger(__name__)
+MAX_STRAY_SLICES = 2
+MAX_STRAY_FRACTION = .05
+
+
+def _drop_stray_end_slices(files, headers):
+    """Drop a few isolated slices at either end of an otherwise regular stack.
+
+    Some scanners store an extra slice (e.g. a planning or tracking image)
+    in the same series, far from the reconstructed volume; one such slice
+    59 mm beyond a 268-slice, 1 mm stack made the whole series unloadable.
+    Only slices outside the longest uniformly spaced run are removed, only at
+    the ends, and only when they are at most MAX_STRAY_SLICES or
+    MAX_STRAY_FRACTION of the series. A gap inside the volume is still a
+    missing-slice error for _validate_stack_geometry.
+    """
+    if len(files) < 3:
+        return files, headers
+    try:
+        orientation = np.asarray(headers[0].ImageOrientationPatient, dtype=float)
+        normal = np.cross(orientation[:3], orientation[3:])
+        z = np.array([np.asarray(h.ImagePositionPatient, dtype=float) @ normal for h in headers])
+    except (AttributeError, TypeError, ValueError):
+        return files, headers  # the validator reports missing geometry
+    order = np.argsort(z)
+    steps = np.diff(z[order])
+    step = float(np.median(steps))
+    if step <= 1e-3:
+        return files, headers
+    regular = np.abs(steps - step) <= max(.01, .01 * step)
+    # Longest run of consecutive regular steps, as slice indices [lo, hi].
+    best, lo = (0, 0), 0
+    for i, ok in enumerate(np.append(regular, False)):
+        if not ok:
+            if i - lo > best[1] - best[0]:
+                best = (lo, i)
+            lo = i + 1
+    lo, hi = best
+    dropped = len(files) - (hi - lo + 1)
+    if dropped == 0 or dropped > max(MAX_STRAY_SLICES, int(MAX_STRAY_FRACTION * len(files))):
+        return files, headers
+    keep = set(order[lo:hi + 1].tolist())
+    log.warning("Ignoring %d stray slice(s) outside the regular %d-slice stack (step %.3f mm)",
+                dropped, hi - lo + 1, step)
+    idx = [i for i in range(len(files)) if i in keep]
+    return [files[i] for i in idx], [headers[i] for i in idx]
+
+
 def _read_image(files: list[str], headers=None):
     """``headers`` are the already-parsed headers of ``files`` (same order),
     when the caller has them; otherwise each file is read again."""
     if headers is None or len(headers) != len(files):
         headers = None
     if len(files) > 1:
-        _validate_stack_geometry(headers or [pydicom.dcmread(f, stop_before_pixels=True) for f in files])
+        headers = headers or [pydicom.dcmread(f, stop_before_pixels=True) for f in files]
+        files, headers = _drop_stray_end_slices(files, headers)
+        _validate_stack_geometry(headers)
         reader = sitk.ImageSeriesReader()
         reader.SetFileNames(files)
         return reader.Execute()

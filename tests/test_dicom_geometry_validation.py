@@ -83,3 +83,45 @@ def test_scrambled_frame_order_rejected():
     headers[1], headers[2] = headers[2], headers[1]
     with pytest.raises(ValueError, match="spatial order"):
         _validate_stack_geometry(headers)
+
+
+def long_stack(n=40, step=1.0):
+    result = []
+    for i in range(n):
+        ds = Dataset()
+        ds.ImagePositionPatient = [0., 0., -500. + i * step]
+        ds.ImageOrientationPatient = [1., 0., 0., 0., 1., 0.]
+        ds.PixelSpacing = [.5, .5]
+        ds.Rows, ds.Columns = 64, 64
+        result.append(ds)
+    return result
+
+
+def test_isolated_end_slice_is_dropped():
+    from server.dicom_io import _drop_stray_end_slices
+    headers = long_stack()
+    headers[-1].ImagePositionPatient = [0., 0., -500. + 38 + 59.]   # far beyond the stack
+    files = [f"f{i}" for i in range(len(headers))]
+    kept_files, kept = _drop_stray_end_slices(files, headers)
+    assert kept_files == files[:-1]
+    _validate_stack_geometry(kept)
+
+
+def test_gap_inside_stack_is_still_an_error():
+    from server.dicom_io import _drop_stray_end_slices
+    headers = long_stack()
+    del headers[20]                                                      # missing slice mid-volume
+    files = [f"f{i}" for i in range(len(headers))]
+    kept_files, kept = _drop_stray_end_slices(files, headers)
+    assert kept_files == files
+    with pytest.raises(ValueError, match="nonuniform"):
+        _validate_stack_geometry(kept)
+
+
+def test_many_stray_slices_are_not_dropped_silently():
+    from server.dicom_io import _drop_stray_end_slices
+    headers = long_stack()
+    for k, ds in enumerate(headers[-3:]):
+        ds.ImagePositionPatient = [0., 0., 100. + 5 * k]
+    files = [f"f{i}" for i in range(len(headers))]
+    assert _drop_stray_end_slices(files, headers)[0] == files
