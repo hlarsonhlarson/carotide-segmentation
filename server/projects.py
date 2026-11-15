@@ -135,8 +135,18 @@ def save_artifact(case, side, stage):
         np.savez_compressed(buf, **job['frames'])
         record['frames'] = write('.npz', buf.getvalue())
         record['provenance'] = job.get('provenance', {})
+    previous = case.saved_artifacts.get(f'{side}:{stage}')
     case.saved_artifacts[f'{side}:{stage}'] = record
     autosave(case)
+    # Re-saving a stage replaces its files; remove the superseded ones so
+    # automatic saving does not accumulate copies of multi-MB results.
+    for key in ('stl', 'vtu', 'vtp', 'result', 'frames'):
+        old = (previous or {}).get(key)
+        if old and old != record.get(key):
+            try:
+                artifact_path(folder, old).unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
 
 
 class ProjectRequest(BaseModel):

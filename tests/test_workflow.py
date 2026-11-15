@@ -224,24 +224,6 @@ def test_invalid_saved_coordinates_are_rejected(case, tmp_path):
 
 
 
-def test_swap_branches_exchanges_paths_contours_and_invalidates_surface(client, case):
-    ica = [[1, 1, 1], [5, 5, 5]]; eca = [[1, 1, 1], [5, 2, 7]]
-    case.control_points[("right", "cca_ica")] = ica
-    case.control_points[("right", "cca_eca")] = eca
-    case.centerline_points[("right", "cca_ica")] = ica
-    case.centerline_points[("right", "cca_eca")] = eca
-    case.segmentation_series[("right", "cca_ica")] = [{"tag": "ica"}]
-    case.built_surfaces["right"] = b"stl"
-    cases._CASES[case.case_id] = case
-    response = client.post(f"/cases/{case.case_id}/centerline/right/swap_branches")
-    assert response.status_code == 200
-    assert case.control_points[("right", "cca_ica")] == eca
-    assert case.control_points[("right", "cca_eca")] == ica
-    assert ("right", "cca_ica") not in case.segmentation_series
-    assert case.segmentation_series[("right", "cca_eca")] == [{"tag": "ica"}]
-    assert "right" not in case.built_surfaces
-
-
 def test_autosave_still_detects_foreign_manifest_after_own_writes(case, tmp_path):
     import json
     from fastapi import HTTPException
@@ -271,3 +253,24 @@ def test_restitch_reuses_hops_and_matches_fresh_paths():
     for a, b in zip(points, points[1:]):
         fresh.extend(centerline_path.stitch(volume, spacing, 'CT', a, b)[1:])
     assert first == again == fresh
+
+
+def test_finished_results_are_saved_automatically_and_replaced(case, tmp_path):
+    import json
+    from server import app as backend, projects
+    case.project_dir = str(tmp_path)
+    projects.atomic_write(tmp_path / 'project.json', projects._manifest_json(projects.snapshot(case)))
+    case.su2_postprocess_jobs['right'] = dict(state='done', result={'value': 1}, frames={
+        'wss_mag_pa': np.ones((2, 3)), 'pressure_pa': np.ones((2, 3))})
+    backend._autosave_artifact(case, 'right', 'cfd')
+    first = dict(case.saved_artifacts['right:cfd'])
+    assert (tmp_path / first['result']).is_file() and (tmp_path / first['frames']).is_file()
+    saved = json.loads((tmp_path / 'project.json').read_text())
+    assert saved['artifacts']['right:cfd']['result'] == first['result']
+    backend._autosave_artifact(case, 'right', 'cfd')
+    second = case.saved_artifacts['right:cfd']
+    assert (tmp_path / second['result']).is_file()
+    assert not (tmp_path / first['result']).exists() and not (tmp_path / first['frames']).exists()
+    # Without a project folder nothing is written and nothing fails.
+    case.project_dir = None
+    backend._autosave_artifact(case, 'right', 'cfd')

@@ -59,3 +59,14 @@ def test_frame_matches_wall_coordinates_and_units(tmp_path):
 def test_bad_output_cannot_be_mapped_silently(tmp_path, option, message):
     with pytest.raises(ValueError, match=message):
         extract_wall_time_series(tmp_path, fixtures(tmp_path, **{option: True}), .01)
+
+
+def test_pinched_boundary_is_split_into_simple_cycles():
+    from server.su2_export import _simple_cycles
+    # Figure-of-eight: a 5-cycle and a 3-cycle sharing vertex 0.
+    edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 0), (0, 5), (5, 6), (6, 0)]
+    cycles = sorted(_simple_cycles(edges), key=len, reverse=True)
+    assert [len(c) for c in cycles] == [5, 3]
+    assert set(cycles[0]) == {0, 1, 2, 3, 4} and set(cycles[1]) == {0, 5, 6}
+    ring = [(i, (i + 1) % 6) for i in range(6)]
+    assert [len(c) for c in _simple_cycles(ring)] == [6]

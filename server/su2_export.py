@@ -68,7 +68,70 @@ def _xyz(point_mm):
     return surface_xyz(point_mm)
 
 
-def _extract_boundary_loops(poly):
+def _simple_cycles(edge_list):
+    """Split a closed boundary into simple cycles.
+
+    A boundary region is usually one ring, but a "pinched" region (a vertex
+    with four boundary edges) is a figure-of-eight. Walking it as one ring
+    silently dropped the smaller cycle: on a real case a 3-point hole next to
+    the ICA outlet stayed uncapped and the surface was not watertight.
+    """
+    remaining = {}
+    for a, b in edge_list:
+        remaining.setdefault(a, []).append(b)
+        remaining.setdefault(b, []).append(a)
+
+    def take(a, b):
+        remaining[a].remove(b)
+        remaining[b].remove(a)
+
+    cycles = []
+    while any(remaining.values()):
+        start = next(v for v, nbrs in remaining.items() if nbrs)
+        path, position = [start], {start: 0}
+        cur = start
+        while True:
+            if not remaining[cur]:
+                break  # open chain (should not happen on a boundary); keep what we have
+            nxt = remaining[cur][0]
+            take(cur, nxt)
+            if nxt in position:
+                # Close the sub-cycle that returns to an earlier vertex.
+                i = position[nxt]
+                cycle = path[i:]
+                if len(cycle) >= 3:
+                    cycles.append(cycle)
+                for v in cycle[1:]:
+                    position.pop(v, None)
+                path = path[:i + 1]
+                cur = nxt
+                if nxt == start and not remaining[start]:
+                    break
+                continue
+            position[nxt] = len(path)
+            path.append(nxt)
+            cur = nxt
+    return cycles
+
+
+def _triangle_cap(points3):
+    pts = vtk.vtkPoints()
+    for p in points3:
+        pts.InsertNextPoint(*p)
+    tri = vtk.vtkCellArray()
+    tri.InsertNextCell(3)
+    for i in range(3):
+        tri.InsertCellPoint(i)
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(pts)
+    poly.SetPolys(tri)
+    return poly
+
+
+def _extract_boundary_regions(poly):
+    """Boundary edges grouped by connected region, each split into simple
+    cycles (largest first). Returns a list of regions; each region is a list
+    of cycles; each cycle a list of world points."""
     edges = vtk.vtkFeatureEdges()
     edges.SetInputData(poly)
     edges.BoundaryEdgesOn()
@@ -84,35 +147,28 @@ def _extract_boundary_loops(poly):
     conn.ColorRegionsOn()
     conn.Update()
     labeled = conn.GetOutput()
+    if not labeled.GetNumberOfPoints():
+        return []
     region_ids = numpy_support.vtk_to_numpy(labeled.GetPointData().GetArray("RegionId"))
-    n_loops = int(region_ids.max()) + 1 if labeled.GetNumberOfPoints() else 0
+    per_region = {}
+    lines = labeled.GetLines()
+    lines.InitTraversal()
+    id_list = vtk.vtkIdList()
+    while lines.GetNextCell(id_list):
+        a, b = id_list.GetId(0), id_list.GetId(1)
+        if region_ids[a] == region_ids[b]:
+            per_region.setdefault(int(region_ids[a]), []).append((a, b))
+    regions = []
+    for region in sorted(per_region):
+        cycles = sorted(_simple_cycles(per_region[region]), key=len, reverse=True)
+        if cycles:
+            regions.append([[labeled.GetPoint(i) for i in cycle] for cycle in cycles])
+    return regions
 
-    loops = []
-    for region in range(n_loops):
-        pt_indices = np.nonzero(region_ids == region)[0]
-        adjacency = {i: [] for i in pt_indices}
-        lines = labeled.GetLines()
-        lines.InitTraversal()
-        id_list = vtk.vtkIdList()
-        while lines.GetNextCell(id_list):
-            a, b = id_list.GetId(0), id_list.GetId(1)
-            if a in adjacency and b in adjacency:
-                adjacency[a].append(b)
-                adjacency[b].append(a)
-        start = pt_indices[0]
-        ordered = [start]
-        prev, cur = None, start
-        while True:
-            nbrs = [n for n in adjacency[cur] if n != prev]
-            if not nbrs:
-                break
-            nxt = nbrs[0]
-            if nxt == start:
-                break
-            ordered.append(nxt)
-            prev, cur = cur, nxt
-        loops.append([labeled.GetPoint(i) for i in ordered])
-    return loops
+
+def _extract_boundary_loops(poly):
+    """The main (largest) cycle of every boundary region."""
+    return [region[0] for region in _extract_boundary_regions(poly)]
 
 
 def _fan_cap(loop_points_world):
@@ -269,7 +325,8 @@ def tag_surface_faces(poly, series_by_branch: dict):
     if series_by_branch.get("cca_eca"):
         far_points["eca_outlet"] = _xyz(series_by_branch["cca_eca"][-1]["point_mm"])
 
-    loops = _extract_boundary_loops(poly)
+    regions = _extract_boundary_regions(poly)
+    loops = [region[0] for region in regions]
     expected = len(far_points)
     if len(loops) != expected:
         raise ValueError(
@@ -299,6 +356,13 @@ def tag_surface_faces(poly, series_by_branch: dict):
             cap = cap_method_for_idx(idx)(loops[idx])
             _tag_cells(cap, FACE_ID_FOR[name])
             append.AddInputData(cap)
+            # Smaller cycles pinched off the same opening belong to it too.
+            for extra in regions[idx][1:]:
+                # A 3-point hole is one triangle; a centroid fan would add
+                # an off-plane vertex that can cut the adjacent wall.
+                small = _triangle_cap(extra) if len(extra) == 3 else _centroid_fan_cap(extra)
+                _tag_cells(small, FACE_ID_FOR[name])
+                append.AddInputData(small)
         append.Update()
         cleaner = vtk.vtkCleanPolyData()
         cleaner.SetInputData(append.GetOutput())

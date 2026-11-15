@@ -529,32 +529,6 @@ def clear_centerline(case_id: str, side: str, branch: str):
     return {"ok": True}
 
 
-@app.post("/cases/{case_id}/centerline/{side}/swap_branches")
-@workflow.edit
-def swap_branches(case_id: str, side: str):
-    """Exchange the CCA→ICA and CCA→ECA paths, contours and annotations.
-
-    Automatic labelling can assign the internal and external carotid the
-    wrong way round. Swapping keeps every point and contour; only which
-    branch they belong to changes. Surface, mesh and CFD are invalidated
-    because their outlets are named after the branches.
-    """
-    case = cases.get(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="unknown case_id")
-    if side not in SIDES:
-        raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
-    ica, eca = (side, "cca_ica"), (side, "cca_eca")
-    for store in (case.control_points, case.centerline_points, case.segmentation_series):
-        a, b = store.pop(ica, None), store.pop(eca, None)
-        if b is not None:
-            store[ica] = b
-        if a is not None:
-            store[eca] = a
-    workflow.invalidate(case, side)
-    return {"side": side, "swapped": True}
-
-
 @app.get("/cases/{case_id}/control_points")
 @workflow.locked
 def get_control_points(case_id: str):
@@ -1016,8 +990,24 @@ def build_surface_endpoint(case_id: str, side: str):
     case.built_surfaces[side] = tmp_path.read_bytes()
     case.stale[side].discard('surface')
     tmp_path.unlink(missing_ok=True)
+    _autosave_artifact(case, side, "surface")
 
     return diag
+
+
+def _autosave_artifact(case, side, stage):
+    """Write a finished surface/mesh/CFD result into the project folder.
+
+    Results used to reach disk only through the explicit Save buttons, so a
+    backend restart lost them. A failure here is logged, never raised: the
+    result itself is fine and can still be saved by hand.
+    """
+    if not case.project_dir:
+        return
+    try:
+        projects.save_artifact(case, side, stage)
+    except Exception:
+        log.exception("automatic save of %s/%s failed", side, stage)
 
 
 @app.get("/cases/{case_id}/mesh/{side}")
@@ -1097,6 +1087,7 @@ def start_su2_mesh(case_id: str, side: str):
                     job.update(state="done", vtu=vtu_bytes, vtp=vtp_bytes,
                                face_map={str(k): v for k, v in face_map.items()}, diag=mesh_diag)
                     case.stale[side].discard('mesh')
+                    _autosave_artifact(case, side, "mesh")
         except Exception as e:
             log.exception("su2 mesh job failed for %s/%s", case_id, side)
             with case.lock:
@@ -1379,6 +1370,7 @@ def start_su2_postprocess(case_id: str, side: str):
                 if case.su2_postprocess_jobs.get(side) is job:
                     case.su2_postprocess_jobs[side] = completed
                     case.stale[side].discard('cfd')
+                    _autosave_artifact(case, side, "cfd")
         except Exception as e:
             log.exception("su2 postprocess job failed for %s/%s", case_id, side)
             with case.lock:
@@ -1417,6 +1409,60 @@ def su2_postprocess_result(case_id: str, side: str):
     if not job or job.get("state") != "done":
         raise HTTPException(status_code=404, detail="no finished postprocess result for this side")
     return job["result"]
+
+
+@app.get("/cases/{case_id}/segment/{side}/su2_postprocess/streamlines")
+def su2_postprocess_streamlines(case_id: str, side: str):
+    """Peak-systole velocity streamlines from the run's own flow snapshots.
+
+    Computed on first request (a few seconds) and cached with the result.
+    """
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    with case.lock:
+        job = case.su2_postprocess_jobs.get(side)
+        if not job or job.get("state") != "done":
+            raise HTTPException(status_code=404, detail="no finished postprocess result for this side")
+        if "streamlines" in job:
+            return job["streamlines"]
+        run_dir = Path((job.get("provenance") or {}).get("run_dir", ""))
+        cap = (job["result"].get("geometry") or {}).get("caps", {}).get("cca_inlet")
+        cycle_s = float((job.get("provenance") or {}).get("params", {}).get("cardiac_cycle_s", 0.8))
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=409, detail="the run's flow snapshots are no longer on disk")
+    if not cap:
+        raise HTTPException(status_code=409, detail="inlet cap geometry is missing from the result")
+    try:
+        lines = su2_postprocess.compute_streamlines(run_dir, cycle_s, su2_run.TIME_STEP_S, cap)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    with case.lock:
+        if case.su2_postprocess_jobs.get(side) is job:
+            job["streamlines"] = lines
+    return lines
+
+
+@app.get("/cases/{case_id}/segment/{side}/su2_postprocess/frames")
+@workflow.locked
+def su2_postprocess_frames(case_id: str, side: str, field: str = "wss"):
+    """All frames of one time-resolved field as little-endian float32,
+    frame-major (frames x points), for smooth playback in the viewer.
+    Size ~ frames * points * 4 bytes (a few MB to ~20 MB); JSON would be
+    several times larger. Shape and times are in the response headers."""
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    job = case.su2_postprocess_jobs.get(side)
+    if not job or job.get("state") != "done":
+        raise HTTPException(status_code=404, detail="no finished postprocess result for this side")
+    key = {"wss": "wss_mag_pa", "pressure": "pressure_pa"}.get(field)
+    if key is None:
+        raise HTTPException(status_code=400, detail="field must be 'wss' or 'pressure'")
+    frames = np.ascontiguousarray(job["frames"][key], dtype="<f4")
+    return Response(content=frames.tobytes(), media_type="application/octet-stream", headers={
+        "X-Frames": str(frames.shape[0]), "X-Points": str(frames.shape[1]),
+    })
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_postprocess/frame/{index}")

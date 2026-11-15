@@ -102,6 +102,19 @@ establish accuracy on patient CTA.
   or edits it. The narrowest lumen is not a validated stenosis detector: a
   naturally small distal artery can be narrower than a mild lesion.
 
+- First calibration against operator contours (`scripts/calibration_report.py`,
+  one study, 9 manual lumen sections, one operator). The operator's boundary
+  lies at a median 0.65x the centre HU. The threshold floor was raised from
+  0.4x to 0.65x the seed HU: median Dice 0.73 -> 0.91, median area error
+  +73% -> +19% (+9% outside the skull base). The radial half-height (FWHM)
+  method took its background from the far end of each ray, which on this
+  study was usually another contrast-filled vessel, so it failed on every
+  section; the background is now the darkest point beyond the core (7 of 9
+  sections measured, Dice 0.88). In the petrous carotid canal all automatic
+  methods leak into the surrounding bone (area 2-3x the operator's); that is
+  not fixed by calibration. Nine sections from one patient are too few to
+  generalize; repeat with more reference sections and operators.
+
 ## Remaining implementation and validation
 
 0. Complete migration of legacy annotations/surfaces to LPS; resampling or

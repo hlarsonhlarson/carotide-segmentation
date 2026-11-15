@@ -162,6 +162,15 @@ def main():
     n_cca = driver.GetNumberMarkerNodes(id_cca) if id_cca >= 0 else 0
     p_ica_applied = ica_map_pa
     p_eca_applied = eca_map_pa
+    # SU2 starts from zero pressure. Sending ~93 mmHg absolute to the outlets
+    # made the pseudo-compressible solver draw fluid in through every boundary
+    # for many steps. Only pressure differences matter for incompressible
+    # flow, so outlets get pressure relative to this reference; postprocessing
+    # adds it back (pressure_reference.json next to the config).
+    p_reference = 0.5 * (ica_map_pa + eca_map_pa)
+    if is_root:
+        with open(os.path.join(os.path.dirname(os.path.abspath(cfg)), "pressure_reference.json"), "w") as f:
+            json.dump({"pressure_reference_pa": p_reference}, f)
     t_start = time.time()
     flow_file = open("boundary_flows.csv", "w", newline="") if is_root else None
     flow_writer = csv.DictWriter(flow_file, fieldnames=[
@@ -185,9 +194,9 @@ def main():
         p_ica_applied, ica_clamped = advance_outlet(wk_ica, dt, q_ica, p_ica_applied)
         p_eca_applied, eca_clamped = advance_outlet(wk_eca, dt, q_eca, p_eca_applied)
         if id_ica >= 0:
-            driver.SetMarkerCustomOutletPressure(id_ica, p_ica_applied)
+            driver.SetMarkerCustomOutletPressure(id_ica, p_ica_applied - p_reference)
         if id_eca >= 0:
-            driver.SetMarkerCustomOutletPressure(id_eca, p_eca_applied)
+            driver.SetMarkerCustomOutletPressure(id_eca, p_eca_applied - p_reference)
 
         driver.BoundaryConditionsUpdate()
         driver.Preprocess(time_iter)

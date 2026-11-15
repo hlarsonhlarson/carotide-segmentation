@@ -29,8 +29,13 @@ def fwhm_contour(image, center_px, pixel_mm, max_radius_mm=6., n_angles=96):
     profiles = map_coordinates(image, [rr, cc], order=1, mode="constant", cval=np.nan)
     profiles = gaussian_filter1d(profiles, .6, axis=1)
     boundary, strengths = [], []
+    beyond_core = radii >= .75
     for profile in profiles:
-        background = float(np.median(profile[-max(3, len(radii) // 6):]))
+        # Background is the darkest tissue the ray crosses outside the core.
+        # The far end of the ray (the previous estimate) is often another
+        # contrast-filled vessel on real CTA, which made every section of a
+        # reference case fail as "weak edge".
+        background = float(np.nanmin(profile[beyond_core]))
         contrast = lumen_hu - background
         if not np.isfinite(background) or contrast < 60:
             return None, {"reason": "weak_or_missing_edge", "lumen_hu": lumen_hu}

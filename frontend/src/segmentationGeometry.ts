@@ -286,7 +286,52 @@ export function labelVesselSegments(
     };
   };
   const a = label(ica, eca, "ica"), b = label(eca, ica, "eca");
-  if (!a || !b) return unknown;
-  return { cca_ica: a.labels, cca_eca: b.labels, split: true,
-           shared: { cca_ica: a.shared, cca_eca: b.shared } };
+  if (a && b)
+    return { cca_ica: a.labels, cca_eca: b.labels, split: true,
+             shared: { cca_ica: a.shared, cca_eca: b.shared } };
+  // The other common way to trace: one path runs from the CCA, the other
+  // starts at the bifurcation (operator placed its first point there).
+  const trunkFirst = sideBranchLabels(ica, eca, "ica", "eca", bifurcationMm);
+  if (trunkFirst) return { cca_ica: trunkFirst.trunk, cca_eca: trunkFirst.branch, split: true,
+                           shared: { cca_ica: 0, cca_eca: trunkFirst.branchShared } };
+  const ecaTrunk = sideBranchLabels(eca, ica, "eca", "ica", bifurcationMm);
+  if (ecaTrunk) return { cca_ica: ecaTrunk.branch, cca_eca: ecaTrunk.trunk, split: true,
+                         shared: { cca_ica: ecaTrunk.branchShared, cca_eca: 0 } };
+  return unknown;
+}
+
+// Distance from which a branch start counts as lying on the trunk: the
+// operator clicks inside the bifurcation lumen, not on the trunk's axis.
+const SIDE_BRANCH_START_MM = 4.0;
+
+function sideBranchLabels(
+  trunk: SegmentationPoint[], branch: SegmentationPoint[],
+  trunkDistal: VesselSegment, branchDistal: VesselSegment, bifurcationMm: number,
+) {
+  if (trunk.length < 2 || branch.length < 2) return null;
+  const start = branch[0].point_mm;
+  if (distanceToPolyline(start, trunk) > SIDE_BRANCH_START_MM) return null;
+  // The trunk must begin well before the branch does (it carries the CCA).
+  const trunkArc = arcLengths(trunk);
+  let nearest = 0, best = Infinity;
+  trunk.forEach((p, i) => {
+    const d = Math.hypot(p.point_mm[0] - start[0], p.point_mm[1] - start[1], p.point_mm[2] - start[2]);
+    if (d < best) { best = d; nearest = i; }
+  });
+  if (nearest === 0 || nearest === trunk.length - 1) return null;
+  // Leading branch sections still inside the trunk lumen belong to the split.
+  let branchShared = 0;
+  for (let i = 0; i < branch.length; i++) {
+    const tolerance = Math.max(SHARED_TOLERANCE_MM, SHARED_RADIUS_FRACTION * (branch[i].radius_mm ?? 0));
+    if (distanceToPolyline(branch[i].point_mm, trunk) <= tolerance) branchShared = i + 1;
+    else break;
+  }
+  const split = trunkArc[nearest];
+  const trunkLabels = trunk.map((_, i): VesselSegment =>
+    Math.abs(trunkArc[i] - split) <= bifurcationMm ? "bifurcation" : i < nearest ? "cca" : trunkDistal);
+  const branchArc = arcLengths(branch);
+  const branchSplit = branchArc[Math.max(branchShared - 1, 0)];
+  const branchLabels = branch.map((_, i): VesselSegment =>
+    i < branchShared || Math.abs(branchArc[i] - branchSplit) <= bifurcationMm ? "bifurcation" : branchDistal);
+  return { trunk: trunkLabels, branch: branchLabels, branchShared };
 }

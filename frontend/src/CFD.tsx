@@ -1,5 +1,37 @@
-import { useEffect, useState } from "react";
-import { ResultMesh } from "./ResultMesh";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ResultMesh, type Streamlines } from "./ResultMesh";
+
+const BLOOD_VISCOSITY_PAS = 0.0035;
+// Field -> label and the default colour range. "auto" = 2nd-98th percentile
+// (single wall nodes at the caps otherwise stretch the scale); fixed ranges
+// follow published carotid CFD figures (shear rate 0-2000 1/s, OSI 0-0.5).
+const FIELDS: Record<string, { label: string; range: "auto" | [number, number] }> = {
+  tawss_pa: { label: "TAWSS, Па", range: "auto" },
+  shear_rate: { label: "Скорость сдвига (TAWSS/μ), 1/с", range: [0, 2000] },
+  osi: { label: "OSI", range: [0, 0.5] },
+  rrt_pa_inv: { label: "RRT, 1/Па", range: "auto" },
+  mean_pressure_mmhg: { label: "Среднее давление, мм рт. ст.", range: "auto" },
+  wss: { label: "WSS в момент времени, Па", range: "auto" },
+  pressure: { label: "Давление в момент времени, Па", range: "auto" },
+};
+function percentile(values: number[], q: number) {
+  const v = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!v.length) return 0;
+  return v[Math.min(v.length - 1, Math.max(0, Math.round(q * (v.length - 1))))];
+}
+// Percentiles of a large sample (all frames of a cycle) from a strided subset.
+function sampled(values: ArrayLike<number>, max = 200000) {
+  const stride = Math.max(1, Math.floor(values.length / max));
+  const out: number[] = [];
+  for (let i = 0; i < values.length; i += stride) out.push(values[i]);
+  return out;
+}
+function niceRange(values: ArrayLike<number>): [number, number] {
+  const v = sampled(values);
+  const lo = percentile(v, 0.02), hi = percentile(v, 0.98);
+  const step = Math.pow(10, Math.floor(Math.log10(Math.max(hi - lo, 1e-9)))) / 2;
+  return [Math.floor(lo / step) * step, Math.ceil(hi / step) * step];
+}
 import { request } from "./Segmentation";
 type Params = {
   psv_cms: number;
@@ -35,27 +67,114 @@ export function CFD({
     [result, setResult] = useState<any>(null),
     [field, setField] = useState("tawss_pa"),
     [frame, setFrame] = useState(0),
-    [frameValues, setFrameValues] = useState<number[] | null>(null);
+    [frames, setFrames] = useState<{ field: string; data: Float32Array; points: number } | null>(null),
+    [playing, setPlaying] = useState(false),
+    [speed, setSpeed] = useState(0.25),
+    [wholeRun, setWholeRun] = useState(false),
+    [manualRange, setManualRange] = useState<[number, number] | null>(null),
+    [showStreamlines, setShowStreamlines] = useState(false),
+    [streamlines, setStreamlines] = useState<Streamlines | null>(null);
+  const timeResolved = field === "wss" || field === "pressure";
+  // All frames of a time-resolved field in one binary request, so playback
+  // only recolours the mesh.
   useEffect(() => {
     let active = true;
-    setFrameValues(null);
-    if (result && (field === "wss" || field === "pressure"))
-      request(route + "/su2_postprocess/frame/" + frame + "?field=" + field)
-        .then((d) => {
-          if (active) setFrameValues(d.values);
+    setFrames(null);
+    setPlaying(false);
+    if (result && timeResolved)
+      fetch("/api" + route + "/su2_postprocess/frames?field=" + field)
+        .then(async (r) => {
+          if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+          const data = new Float32Array(await r.arrayBuffer());
+          if (active) setFrames({ field, data, points: Number(r.headers.get("X-Points")) || result.points_mm.length });
         })
-        .catch((e) => {
-          if (active) onError(String(e));
-        });
-    return () => {
-      active = false;
+        .catch((e) => { if (active) onError(String(e)); });
+    return () => { active = false; };
+  }, [route, result, field]);
+  // Playback runs over the settled (last) cardiac cycle unless asked otherwise.
+  const frameIndices = useMemo<number[]>(() => {
+    if (!result) return [];
+    const times: number[] = result.times_s;
+    const all = times.map((_, i) => i);
+    const cycle = params?.cardiac_cycle_s;
+    if (wholeRun || !cycle || !times.length) return all;
+    // Exactly one cycle ending at the last recorded frame.
+    const end = times[times.length - 1], dt = times.length > 1 ? end - times[times.length - 2] : 0;
+    const last = all.filter((i) => times[i] > end - cycle + dt / 2);
+    return last.length ? last : all;
+  }, [result, wholeRun, params?.cardiac_cycle_s]);
+  const frameValues = useMemo(() => frames && frames.field === field
+    ? frames.data.subarray(frame * frames.points, (frame + 1) * frames.points) : null, [frames, field, frame]);
+  useEffect(() => {
+    if (frameIndices.length && !frameIndices.includes(frame)) setFrame(frameIndices[0]);
+  }, [frameIndices]);
+  // Playback follows simulated time (frames may be recorded unevenly),
+  // slowed down by `speed`; the shown frame is the last one at or before it.
+  const playRef = useRef({ frameIndices, frame });
+  playRef.current = { frameIndices, frame };
+  useEffect(() => {
+    if (!playing || !result) return;
+    const times: number[] = result.times_s;
+    const idx = playRef.current.frameIndices;
+    if (idx.length < 2) return;
+    const t0 = times[idx[0]], tn = times[idx[idx.length - 1]];
+    const span = tn - t0 + (tn - times[idx[idx.length - 2]]);
+    const startSim = times[playRef.current.frame] ?? t0;
+    const startWall = performance.now();
+    let raf = 0;
+    const tick = (now: number) => {
+      const sim = t0 + ((startSim - t0 + ((now - startWall) / 1000) * speed) % span);
+      let lo = 0, hi = idx.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (times[idx[mid]] <= sim + 1e-9) lo = mid; else hi = mid - 1;
+      }
+      if (idx[lo] !== playRef.current.frame) setFrame(idx[lo]);
+      raf = requestAnimationFrame(tick);
     };
-  }, [route, result, field, frame]);
-  const values: number[] = result
-    ? field === "wss" || field === "pressure"
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [playing, speed, result, frameIndices]);
+  // One colour scale for the whole played interval, so colours do not jump.
+  const cycleRange = useMemo<[number, number] | null>(() => {
+    if (!frames || frames.field !== field || !frameIndices.length) return null;
+    const a = frameIndices[0], b = frameIndices[frameIndices.length - 1] + 1;
+    return niceRange(frames.data.subarray(a * frames.points, b * frames.points));
+  }, [frames, field, frameIndices]);
+  const values: ArrayLike<number> = useMemo(() => result
+    ? timeResolved
       ? frameValues || []
-      : result[field]
-    : [];
+      : field === "shear_rate"
+        ? result.tawss_pa.map((v: number) => v / BLOOD_VISCOSITY_PAS)
+        : field === "mean_pressure_mmhg"
+          ? result.mean_pressure_pa.map((v: number) => v / 133.322)
+          : result[field]
+    : [], [result, field, frameValues]);
+  const preset = FIELDS[field]?.range ?? "auto";
+  const autoRange = useMemo<[number, number]>(
+    () => (preset !== "auto" ? preset : timeResolved ? cycleRange ?? [0, 1] : niceRange(values)),
+    [timeResolved ? cycleRange : values, preset, timeResolved]);
+  const colourRange = useMemo<[number, number]>(() => manualRange ?? autoRange, [manualRange, autoRange]);
+  const streamRange = useMemo<[number, number] | undefined>(
+    () => (streamlines ? [0, niceRange(streamlines.speed_cms)[1]] : undefined), [streamlines]);
+  useEffect(() => { setManualRange(null); }, [field]);
+  // Finished results open by themselves; no separate "open" step.
+  useEffect(() => {
+    let active = true;
+    if (post === "done" && !result)
+      request(route + "/su2_postprocess/result")
+        .then((r) => { if (active) setResult(r); })
+        .catch((e) => { if (active) onError(String(e)); });
+    return () => { active = false; };
+  }, [post, result, route]);
+  useEffect(() => {
+    let active = true;
+    if (showStreamlines && result && !streamlines)
+      request(route + "/su2_postprocess/streamlines")
+        .then((d) => { if (active) setStreamlines(d); })
+        .catch((e) => { if (active) { onError(String(e)); setShowStreamlines(false); } });
+    return () => { active = false; };
+  }, [showStreamlines, result, route]);
   useEffect(() => {
     let active = true;
     setResult(null);
@@ -176,126 +295,107 @@ export function CFD({
       >
         Обработать результаты
       </button>
-      <p>Обработка: {post}</p>
-      <button
-        disabled={busy || post !== "done"}
-        onClick={() =>
-          action(async () =>
-            setResult(await request(route + "/su2_postprocess/result")),
-          )
-        }
-      >
-        Открыть результаты
-      </button>
+      {post === "running" && <p role="status">Обработка результатов…</p>}
       {result && (
         <>
-          <p>
-            Вычисление завершено. Физическая достоверность ещё не подтверждена.
-          </p>
-          {result.temporal_quality ? <section aria-label="Периодичность CFD">
-            <h3>Проверка последних циклов</h3>
-            <p>Интервал усреднения: {result.temporal_quality.window_start_s.toFixed(3)}–
-              {result.temporal_quality.window_end_s.toFixed(3)} с
-              {" "}({result.temporal_quality.full_cycle ? "полный цикл" : "неполный цикл"}).</p>
-            <p>{({
-              insufficient_cycles: "Недостаточно данных для сравнения двух полных циклов.",
-              sparse_sampling: "Снимки сохранены слишком редко для проверки периодичности.",
-              insufficient_signal: "Недостаточный сигнал для относительного сравнения.",
-              within_tolerance: "Глобальное RMS-различие двух циклов находится в пределах допуска.",
-              not_periodic: "Различие двух последних циклов превышает допуск.",
-            } as Record<string, string>)[result.temporal_quality.status]}</p>
-            <p>Допуск RMS: {(result.temporal_quality.relative_tolerance * 100).toFixed(1)}%.
-              Это проверка временной повторяемости полей, не сходимости сетки или калибровки границ.</p>
-            {result.temporal_quality.comparison && ["wss", "pressure"].map(name => {
-              const metric = result.temporal_quality.comparison[name];
-              return <p key={name}>{name === "wss" ? "Вектор WSS" : "Давление"}:
-                {" "}RMS-различие {metric.rms_difference_pa.toPrecision(3)} Па ·
-                относительное {metric.relative_rms == null ? "не определено" : `${(metric.relative_rms * 100).toFixed(2)}%`} ·
-                максимум по компонентам {metric.max_component_difference_pa.toPrecision(3)} Па.
-              </p>;
-            })}
-            {result.temporal_quality.undefined_osi_nodes > 0 && <p>
-              OSI не определён в {result.temporal_quality.undefined_osi_nodes} узлах с нулевым WSS;
-              для отображения используется 0. Маска валидности включена в JSON.
-            </p>}
-          </section> : <p>В сохранённом результате нет проверки периодичности. Повторите обработку исходных кадров.</p>}
-          {result.flow_balance?.status === "measured" ? <section aria-label="Баланс потока CFD">
-            <h3>Баланс потока</h3>
-            <p>Оценка по узловым скоростям на границах; это не невязка консервативных численных потоков решателя.</p>
-            <p>Средняя абсолютная невязка: {result.flow_balance.mean_absolute_imbalance_mlps.toPrecision(3)} мл/с ·
-              относительная {result.flow_balance.relative_mean_absolute_imbalance == null ? "не определена"
-                : `${(result.flow_balance.relative_mean_absolute_imbalance * 100).toFixed(2)}%`}.</p>
-            <p>Объём за {result.flow_balance.full_cycle ? "последний цикл" : "неполный интервал"}:
-              {" "}вход {result.flow_balance.inlet_volume_ml.toFixed(3)} мл ·
-              выходы {result.flow_balance.outlet_volume_ml.toFixed(3)} мл.</p>
-            <p>Отсчёты с обратным потоком: вход {result.flow_balance.reverse_samples.inlet},
-              {" "}ICA {result.flow_balance.reverse_samples.ica}, ECA {result.flow_balance.reverse_samples.eca}.
-              Ограничение давления сработало на {result.flow_balance.pressure_clamped_steps} шагах.</p>
-          </section> : <p>Записанных данных для проверки баланса потока нет.</p>}
-          <select
-            aria-label="Показатель CFD"
-            value={field}
-            onChange={(e) => setField(e.target.value)}
-          >
-            {[
-              ["tawss_pa", "TAWSS, Па"],
-              ["osi", "OSI"],
-              ["rrt_pa_inv", "RRT, 1/Па"],
-              ["mean_pressure_pa", "Среднее давление, Па"],
-              ["wss", "WSS по времени, Па"],
-              ["pressure", "Давление по времени, Па"],
-            ].map(([k, t]) => (
-              <option key={k} value={k}>
-                {t}
-              </option>
-            ))}
-          </select>
-          {(field === "wss" || field === "pressure") && (
-            <label>
-              Кадр {frame + 1} · {result.times_s[frame]} с
-              <input
-                type="range"
-                min="0"
-                max={result.times_s.length - 1}
-                value={frame}
-                onChange={(e) => setFrame(+e.target.value)}
-              />
+          {(() => {
+            // Checks of the run, folded into one line; details on demand.
+            const tq = result.temporal_quality, fb = result.flow_balance;
+            const periodic = tq ? ({
+              within_tolerance: "циклы повторяются",
+              not_periodic: "циклы не совпадают",
+              insufficient_cycles: "один полный цикл",
+              sparse_sampling: "редкие кадры",
+              insufficient_signal: "слабый сигнал",
+            } as Record<string, string>)[tq.status] : null;
+            const imbalance = fb?.status === "measured" && fb.relative_mean_absolute_imbalance != null
+              ? `невязка потока ${(fb.relative_mean_absolute_imbalance * 100).toFixed(1)}%` : null;
+            return (
+              <details className="cfd-checks">
+                <summary>Проверка расчёта: {[periodic, imbalance].filter(Boolean).join(" · ") || "нет данных"}</summary>
+                {tq && <p>Усреднение {tq.window_start_s.toFixed(3)}–{tq.window_end_s.toFixed(3)} с
+                  {tq.comparison && ["wss", "pressure"].map((name) => {
+                    const m = tq.comparison[name];
+                    return ` · ${name === "wss" ? "WSS" : "давление"}: RMS-различие циклов ${
+                      m.relative_rms == null ? "—" : `${(m.relative_rms * 100).toFixed(1)}%`}`;
+                  }).join("")}</p>}
+                {fb?.status === "measured" && <p>Объём за цикл: вход {fb.inlet_volume_ml.toFixed(2)} мл ·
+                  выходы {fb.outlet_volume_ml.toFixed(2)} мл · обратный поток: вход {fb.reverse_samples.inlet},
+                  ICA {fb.reverse_samples.ica}, ECA {fb.reverse_samples.eca}</p>}
+              </details>
+            );
+          })()}
+          <div className="result-controls">
+            <label>Показатель
+              <select aria-label="Показатель CFD" value={field} onChange={(e) => setField(e.target.value)}>
+                {Object.entries(FIELDS).map(([k, f]) => <option key={k} value={k}>{f.label}</option>)}
+              </select>
             </label>
-          )}
+            <label>Шкала от
+              <input type="number" step="any" value={colourRange[0]}
+                onChange={(e) => setManualRange([+e.target.value, colourRange[1]])} />
+            </label>
+            <label>до
+              <input type="number" step="any" value={colourRange[1]}
+                onChange={(e) => setManualRange([colourRange[0], +e.target.value])} />
+            </label>
+            <label className="checkbox">
+              <input type="checkbox" checked={showStreamlines}
+                onChange={(e) => setShowStreamlines(e.target.checked)} /> Линии тока (пик систолы)
+            </label>
+          </div>
+          {timeResolved && frameIndices.length > 0 && (() => {
+            const k = Math.max(0, frameIndices.indexOf(frame));
+            const t0 = result.times_s[frameIndices[0]];
+            const cycle = params?.cardiac_cycle_s;
+            const t = result.times_s[frame] - (wholeRun ? 0 : t0);
+            return (
+              <div className="result-playback" aria-label="Проигрывание кадров">
+                <button className="primary" disabled={!frameValues} onClick={() => setPlaying((p) => !p)}>
+                  {playing ? "❚❚ Пауза" : "▶ Пуск"}
+                </button>
+                <button disabled={!frameValues} title="Предыдущий кадр"
+                  onClick={() => { setPlaying(false); setFrame(frameIndices[(k - 1 + frameIndices.length) % frameIndices.length]); }}>‹</button>
+                <button disabled={!frameValues} title="Следующий кадр"
+                  onClick={() => { setPlaying(false); setFrame(frameIndices[(k + 1) % frameIndices.length]); }}>›</button>
+                <input type="range" min="0" max={frameIndices.length - 1} value={k} aria-label="Кадр"
+                  onChange={(e) => { setPlaying(false); setFrame(frameIndices[+e.target.value]); }} />
+                <span className="time">
+                  {frameValues ? <>Кадр {k + 1}/{frameIndices.length} · t = {t.toFixed(3)} с
+                    {!wholeRun && cycle ? ` (${Math.round((100 * t) / cycle)}% цикла)` : ""}</> : "Загрузка кадров…"}
+                </span>
+                <label>Скорость
+                  <select value={speed} onChange={(e) => setSpeed(+e.target.value)} aria-label="Скорость проигрывания">
+                    {[0.05, 0.1, 0.25, 0.5, 1].map((v) => (
+                      <option key={v} value={v}>{v === 1 ? "реальное время" : `×${v} (замедленно)`}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="checkbox">
+                  <input type="checkbox" checked={wholeRun} onChange={(e) => setWholeRun(e.target.checked)} />
+                  Весь расчёт (не только последний цикл)
+                </label>
+              </div>
+            );
+          })()}
           {values.length > 0 && (
             <ResultMesh
               points={result.points_mm}
               triangles={result.triangles}
               values={values}
+              range={colourRange}
+              title={FIELDS[field]?.label ?? field}
+              streamlines={showStreamlines ? streamlines : null}
+              streamRange={streamRange}
+              fileName={timeResolved ? `cfd-${field}-frame${frame + 1}` : `cfd-${field}`}
+              caption={timeResolved && frameValues
+                ? `t = ${(result.times_s[frame] - (wholeRun ? 0 : result.times_s[frameIndices[0]] ?? 0)).toFixed(3)} с`
+                : undefined}
             />
           )}
-          <p>
-            Узлов: {result.points_mm.length} · Кадров: {result.times_s.length}
-          </p>
-          <p>
-            Диапазон:{" "}
-            {values
-              .reduce((a: number, b: number) => Math.min(a, b), Infinity)
-              .toPrecision(4)}{" "}
-            —{" "}
-            {values
-              .reduce((a: number, b: number) => Math.max(a, b), -Infinity)
-              .toPrecision(4)}
-          </p>
-          <a
-            href={"/api" + route + "/su2_postprocess/result"}
-            download="cfd-results.json"
-          >
-            Скачать результаты JSON
+          <a href={"/api" + route + "/su2_postprocess/result"} download="cfd-results.json">
+            Скачать результаты (JSON)
           </a>
-          <button
-            disabled={busy}
-            onClick={() =>
-              action(() => request(base + "/save/cfd_results/" + side, {}))
-            }
-          >
-            Сохранить результаты в проект
-          </button>
         </>
       )}
     </section>

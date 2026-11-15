@@ -32,6 +32,8 @@ import logging
 import re
 from pathlib import Path
 
+import json
+
 import numpy as np
 import vtk
 from vtk.util import numpy_support
@@ -128,6 +130,11 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
     files = _flow_files_sorted(run_dir)
     if not files:
         raise ValueError(f"no flow_*.vtu snapshots found in {run_dir}")
+    # Runs since the gauge-pressure change solve relative to a reference
+    # pressure (see su2_pulsatile_runner.py); older runs have no file.
+    reference_file = Path(run_dir) / "pressure_reference.json"
+    pressure_reference = (float(json.loads(reference_file.read_text())["pressure_reference_pa"])
+                          if reference_file.is_file() else 0.0)
 
     points_mm = None
     times_s = []
@@ -170,7 +177,7 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
         if cf.shape != (ug.GetNumberOfPoints(), 3) or pressure_values.shape != (ug.GetNumberOfPoints(),):
             raise ValueError(f"CFD frame {step} has invalid WSS or pressure dimensions")
         wss_vec = (0.5 * cf[wall_vol_idx]).astype(np.float32)
-        pressure = pressure_values[wall_vol_idx].astype(np.float32)
+        pressure = (pressure_values[wall_vol_idx] + pressure_reference).astype(np.float32)
         if not np.isfinite(wss_vec).all() or not np.isfinite(pressure).all():
             raise ValueError(f"CFD frame {step} contains nonfinite wall fields")
 
@@ -326,3 +333,107 @@ def compute_geometry_stats(vtp_bytes: bytes, face_map: dict) -> dict:
             })
     stats["angles"] = angles
     return stats
+
+
+def peak_systole_snapshot(run_dir: Path, cycle_s: float, time_step_s: float):
+    """Flow snapshot of the last recorded cycle with the largest inlet flow.
+
+    Falls back to the latest snapshot when no boundary-flow log exists.
+    Returns (path, time_s).
+    """
+    files = _flow_files_sorted(Path(run_dir))
+    if not files:
+        raise ValueError(f"no flow_*.vtu snapshots found in {run_dir}")
+    last_step = files[-1][1]
+    in_cycle = [(f, s) for f, s in files if (last_step - s) * time_step_s < cycle_s - 1e-9] or files[-1:]
+    flows = {}
+    log_path = Path(run_dir) / "boundary_flows.csv"
+    if log_path.is_file():
+        import csv
+        with open(log_path) as fh:
+            for row in csv.DictReader(fh):
+                # Log rows are 1-based solver steps; snapshot k is written after step k+1.
+                flows[int(row["step"]) - 1] = float(row["q_inlet_mlps"])
+    path, step = max(in_cycle, key=lambda fs: flows.get(fs[1], -np.inf)) if flows else in_cycle[-1]
+    return path, step * time_step_s
+
+
+def compute_streamlines(run_dir: Path, cycle_s: float, time_step_s: float, inlet_cap: dict,
+                        n_seeds: int = 350, seed=0):
+    """Velocity streamlines at peak systole, seeded across the inlet section.
+
+    inlet_cap: {"centroid_mm", "normal_mm" (outward), "equivalent_diameter_mm"}.
+    Returns {"time_s", "points_mm" (flat polyline points), "offsets" (start
+    index of each line, plus the total), "speed_cms" per point}.
+    """
+    path, time_s = peak_systole_snapshot(run_dir, cycle_s, time_step_s)
+    reader = vtk.vtkXMLUnstructuredGridReader()
+    reader.SetFileName(str(path))
+    reader.Update()
+    grid = reader.GetOutput()
+    grid.GetPointData().SetActiveVectors("Velocity")
+
+    centre = np.asarray(inlet_cap["centroid_mm"], float) / 1000.0
+    normal = np.asarray(inlet_cap["normal_mm"], float)
+    normal /= np.linalg.norm(normal)
+    radius = inlet_cap["equivalent_diameter_mm"] / 2000.0
+    u = np.cross(normal, [1.0, 0, 0] if abs(normal[0]) < 0.9 else [0, 1.0, 0])
+    u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    # Seed slightly inside the domain. Which side of the cap that is is
+    # tested on the mesh: the stored cap normal is not reliably outward.
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(grid)
+    locator.BuildLocator()
+    inward = None
+    for sign in (-1.0, 1.0):
+        if locator.FindCell(list(centre + sign * normal * radius * 0.3)) >= 0:
+            inward = sign * normal
+            break
+    if inward is None:
+        raise ValueError("could not place streamline seeds inside the inlet")
+    rng = np.random.default_rng(seed)
+    # Uniform over the disc.
+    r = radius * 0.92 * np.sqrt(rng.random(n_seeds))
+    a = 2 * np.pi * rng.random(n_seeds)
+    seeds_xyz = centre + inward * radius * 0.15 + np.outer(r * np.cos(a), u) + np.outer(r * np.sin(a), v)
+    seeds = vtk.vtkPolyData()
+    pts = vtk.vtkPoints()
+    pts.SetData(numpy_support.numpy_to_vtk(np.ascontiguousarray(seeds_xyz), deep=True))
+    seeds.SetPoints(pts)
+
+    tracer = vtk.vtkStreamTracer()
+    tracer.SetInputData(grid)
+    tracer.SetSourceData(seeds)
+    tracer.SetIntegratorTypeToRungeKutta45()
+    tracer.SetIntegrationDirectionToForward()
+    tracer.SetIntegrationStepUnit(vtk.vtkStreamTracer.CELL_LENGTH_UNIT)
+    tracer.SetInitialIntegrationStep(0.3)
+    tracer.SetMaximumPropagation(0.6)
+    tracer.SetMaximumNumberOfSteps(6000)
+    tracer.SetTerminalSpeed(1e-5)
+    tracer.Update()
+    out = tracer.GetOutput()
+
+    points = numpy_support.vtk_to_numpy(out.GetPoints().GetData()) if out.GetNumberOfPoints() else np.zeros((0, 3))
+    speed = np.linalg.norm(numpy_support.vtk_to_numpy(out.GetPointData().GetArray("Velocity")), axis=1) \
+        if out.GetNumberOfPoints() else np.zeros(0)
+    lines, offsets, kept_points, kept_speed = out.GetLines(), [0], [], []
+    lines.InitTraversal()
+    ids = vtk.vtkIdList()
+    while lines.GetNextCell(ids):
+        idx = np.array([ids.GetId(k) for k in range(ids.GetNumberOfIds())])
+        if len(idx) < 4:
+            continue
+        idx = idx[::2] if len(idx) > 400 else idx  # thin long lines for transfer
+        kept_points.append(points[idx] * 1000.0)
+        kept_speed.append(speed[idx] * 100.0)
+        offsets.append(offsets[-1] + len(idx))
+    if kept_points:
+        flat_points = np.vstack(kept_points)
+        flat_speed = np.concatenate(kept_speed)
+    else:
+        flat_points, flat_speed = np.zeros((0, 3)), np.zeros(0)
+    return {"time_s": float(time_s), "snapshot": Path(path).name,
+            "points_mm": np.round(flat_points, 3).ravel().tolist(),
+            "offsets": offsets, "speed_cms": np.round(flat_speed, 2).tolist()}

@@ -25,7 +25,13 @@ CENTER_SAMPLE_RADIUS_PX = 2
 # in-lumen HU variation/noise. CT_MIN_ABSOLUTE_FLOOR_HU guards the low
 # end for a weak/borderline seed (where the ratio alone would barely
 # exclude anything) and keeps air/fat out regardless.
-CT_RELATIVE_FLOOR_RATIO = 0.4
+# Calibrated against operator contours (manual reference series, 9 sections, 2026-11):
+# the operator's lumen boundary sits at a median 0.65x the centre HU. At 0.4
+# the threshold lumen was 50% larger than the operator's on good sections; at
+# 0.65 it is +9% (Dice 0.94). 0.7 fitted slightly better (+3%) but cuts real
+# lumen sooner where the centre is brighter than the periphery; more reference
+# sections are needed before going further.
+CT_RELATIVE_FLOOR_RATIO = 0.65
 CT_MIN_ABSOLUTE_FLOOR_HU = 100.0
 CT_CALCIUM_OVER_LUMEN = 1.3
 CT_CALCIUM_MIN_HU = 500.0

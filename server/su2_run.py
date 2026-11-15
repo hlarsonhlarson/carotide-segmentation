@@ -43,7 +43,13 @@ RUNNER_SCRIPT = str(Path(__file__).resolve().parent / "su2_pulsatile_runner.py")
 N_CARDIAC_CYCLES = 2
 TIME_STEP_S = 0.005
 INNER_ITER = 20
-CFL_NUMBER = 1.0
+# Pseudo-time CFL of the implicit inner iterations. At 1.0 (carried over from
+# the original pipeline) 20 inner iterations reduced the residual by only
+# ~0.14 decades per physical step; on a real carotid mesh fluid accumulated
+# inside and both outlets showed inflow (boundary imbalance 160-380%). At 200
+# the outlets carry the inflow and the nodal-flux imbalance falls to ~20%, the
+# level of the straight-duct check. Re-verify on new meshes.
+CFL_NUMBER = 200.0
 FLUID_DENSITY_KG_M3 = 1050.0
 FLUID_VISCOSITY_PAS = 0.0035
 MMHG_TO_PA = 133.322

@@ -44,3 +44,14 @@ def test_mpr_pixel_centers_match_reported_world_coordinates():
     rows, cols = np.indices(image.shape)
     world = origin + cols[..., None] * .2 * u + rows[..., None] * .2 * v
     np.testing.assert_allclose(image, world @ [3, 2, 1], rtol=1e-6)
+
+
+def test_unsegmented_branch_ends_are_not_part_of_the_vessel():
+    from server.build_surface import _strip_unsegmented_ends
+    ring = [[0, 1, 0], [0, 0, 1], [0, -1, 0]]
+    series = [{"point_mm": [i, 0, 0]} for i in range(6)]
+    for i in (1, 2, 4):
+        series[i]["contour_mm"] = ring
+    kept = _strip_unsegmented_ends(series)
+    assert [p["point_mm"][0] for p in kept] == [1, 2, 3, 4]
+    assert _strip_unsegmented_ends([{"point_mm": [0, 0, 0]}]) == []

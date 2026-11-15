@@ -431,13 +431,7 @@ export function PathEditor({
             >
               Очистить ветвь
             </button>
-            <button
-              disabled={busy || !branches.some((b) => (points[side + ":" + b] || []).length)}
-              title="Поменять местами пути и контуры CCA→ICA и CCA→ECA, если ветви определены наоборот"
-              onClick={() => action(() => request(`${base}/centerline/${side}/swap_branches`, {}))}
-            >
-              ICA ⇄ ECA
-            </button>
+
             <button
               className="primary"
               disabled={busy || count < 2}

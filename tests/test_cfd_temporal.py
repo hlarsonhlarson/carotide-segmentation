@@ -81,3 +81,14 @@ def test_sparse_interval_bracketing_cycle_start_is_not_hidden():
 def test_invalid_time_series_rejected(times, cycle):
     with pytest.raises(ValueError):
         compute_derived_fields(samples(times), cycle)
+
+
+def test_peak_systole_snapshot_is_the_strongest_inflow_of_the_last_cycle(tmp_path):
+    from server.su2_postprocess import peak_systole_snapshot
+    for step in range(0, 40, 4):
+        (tmp_path / f"flow_{step:05d}.vtu").write_text("")
+    rows = ["step,q_inlet_mlps"] + [f"{s + 1},{(30.0 if s in (8, 28) else 10.0) - (5 if s == 8 else 0)}" for s in range(40)]
+    (tmp_path / "boundary_flows.csv").write_text("\n".join(rows))
+    # Cycle of 20 steps at dt = 0.01 s: the last cycle holds snapshots 20..36.
+    path, t = peak_systole_snapshot(tmp_path, cycle_s=0.2, time_step_s=0.01)
+    assert path.endswith("flow_00028.vtu") and abs(t - 0.28) < 1e-9

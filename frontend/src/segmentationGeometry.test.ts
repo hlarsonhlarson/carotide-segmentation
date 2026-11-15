@@ -151,6 +151,16 @@ describe("vessel segment labels", () => {
     expect(labels.cca_ica[0]).toBe("cca");
   });
 
+  it("handles an ECA path that starts at the bifurcation", () => {
+    const ecaFromSplit = [at(40, 0.5), ...eca.slice(9)];
+    const labels = labelVesselSegments(ica, ecaFromSplit, 10);
+    expect(labels.split).toBe(true);
+    expect(labels.cca_ica.slice(0, 6)).toEqual(Array(6).fill("cca"));
+    expect(labels.cca_ica.at(-1)).toBe("ica");
+    expect(labels.cca_eca[0]).toBe("bifurcation");
+    expect(labels.cca_eca.at(-1)).toBe("eca");
+  });
+
   it("keeps branch labels when the split is unknown", () => {
     expect(labelVesselSegments(ica, []).cca_ica.every(l => l === "ica")).toBe(true);
     const apart = eca.map(p => ({ ...p, point_mm: [p.point_mm[0], p.point_mm[1] + 20, 0] }));
