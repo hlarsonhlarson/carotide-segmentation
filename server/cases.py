@@ -1,4 +1,6 @@
 """In-memory case registry. One process, one user — no DB needed yet."""
+import os
+import time
 import uuid
 import threading
 from dataclasses import dataclass, field
@@ -14,12 +16,19 @@ class CaseState:
     origin_mm: np.ndarray   # (z, y, x)
     modality: str
     source_path: str
+    # Intensity statistics of the immutable image, computed once per load.
+    array_min: float = field(init=False)
+    default_window: tuple[float, float] = field(init=False)
     # Which DICOM series (of possibly several in source_path) this case
     # is — None when the folder only had one and no choice was made.
     # Saved into the project manifest (see app.py's /projects/open) so
     # reopening a saved project reloads the exact same series rather
     # than re-prompting or guessing.
     series_uid: str | None = None
+    display_flips: dict = field(default_factory=dict)
+    # Physical patient LPS direction in XYZ order. Viewer/editing coordinates
+    # retain their legacy ZYX convention; model I/O must preserve this matrix.
+    direction_lps: np.ndarray = field(default_factory=lambda: np.eye(3))
     # {(side, branch): [[z,y,x], ...]} — dense auto-stitched path, voxel
     # coords, rebuilt from control_points whenever one is added/moved/deleted.
     centerline_points: dict = field(default_factory=dict)
@@ -33,9 +42,18 @@ class CaseState:
     # resampled control point per entry, segmentation added as the user
     # works through it.
     segmentation_series: dict = field(default_factory=dict)
+    # One automatic segmentation job for the loaded study.  It is intentionally
+    # transient: source data, edits and accepted results live in project.json;
+    # an interrupted model run must be restarted explicitly after a reload.
+    autoseed_job: dict | None = None
+    # Explicit operator acknowledgement for the current automatic draft.  A
+    # completed model job alone is never sufficient to export geometry/CFD.
+    autoseed_review: dict = field(default_factory=dict)
     # {side: stl_bytes} — the last built surface per side, kept in memory
     # so GET can serve it without re-building or touching the filesystem.
     built_surfaces: dict = field(default_factory=dict)
+    surface_cache: dict = field(default_factory=dict)
+    surface_cache_lock: object = field(default_factory=threading.Lock, repr=False)
     # {side: {"state": "running"|"done"|"error", "vtu": bytes, "vtp": bytes,
     #         "face_map": dict, "diag": dict, "error": str}} — the SU2-
     # ready volume+surface mesh job, run in a background thread since a
@@ -88,9 +106,48 @@ class CaseState:
     stale: dict = field(default_factory=lambda: {side: set() for side in ("left", "right")})
     saved_artifacts: dict = field(default_factory=dict)
     project_warnings: list = field(default_factory=list)
+    last_access: float = field(default_factory=time.monotonic, repr=False)
+
+    def __post_init__(self):
+        self.array_min = float(self.array.min())
+        if self.modality == "CT":
+            self.default_window = (300.0, 800.0)
+        else:
+            lo, hi = np.percentile(self.array, [1.0, 99.0])
+            if hi <= lo:
+                hi = lo + 1.0
+            self.default_window = (float((lo + hi) / 2.0), float(hi - lo))
 
 
 _CASES: dict[str, CaseState] = {}
+_REGISTRY_LOCK = threading.Lock()
+# Each case holds a full CT volume plus mesh bytes; without a bound every new
+# study load stays resident until the process restarts.
+MAX_CASES = max(1, int(os.environ.get("CAROTID_MAX_CASES", "3")))
+
+
+def _has_running_job(case: CaseState) -> bool:
+    jobs = [case.autoseed_job, *case.su2_mesh_jobs.values(),
+            *case.su2_run_jobs.values(), *case.su2_postprocess_jobs.values()]
+    return any(job and job.get("state") == "running" for job in jobs)
+
+
+def _evictable(case: CaseState) -> bool:
+    """Only drop a case when nothing would be lost: its edits are autosaved
+    into a project folder, or it has no edits at all."""
+    if _has_running_job(case):
+        return False
+    unsaved = any(case.control_points.values()) or any(case.segmentation_series.values())
+    return case.project_dir is not None or not unsaved
+
+
+def _evict_over_limit(keep: str) -> None:
+    candidates = sorted(
+        (c for c in _CASES.values() if c.case_id != keep and _evictable(c)),
+        key=lambda c: c.last_access,
+    )
+    while len(_CASES) > MAX_CASES and candidates:
+        _CASES.pop(candidates.pop(0).case_id, None)
 
 
 def create(array, spacing_mm, origin_mm, modality, source_path, series_uid=None) -> CaseState:
@@ -104,9 +161,14 @@ def create(array, spacing_mm, origin_mm, modality, source_path, series_uid=None)
         source_path=source_path,
         series_uid=series_uid,
     )
-    _CASES[case_id] = case
+    with _REGISTRY_LOCK:
+        _CASES[case_id] = case
+        _evict_over_limit(keep=case_id)
     return case
 
 
 def get(case_id: str) -> CaseState | None:
-    return _CASES.get(case_id)
+    case = _CASES.get(case_id)
+    if case is not None:
+        case.last_access = time.monotonic()
+    return case

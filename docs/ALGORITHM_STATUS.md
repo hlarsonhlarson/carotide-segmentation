@@ -1,0 +1,196 @@
+# Algorithm implementation status
+
+This tracks implementation, not clinical validation. Synthetic tests do not
+establish accuracy on patient CTA.
+
+## Implemented in the current working tree
+
+- DICOM sorting uses the slice-normal projection of ImagePositionPatient.
+- Classic stacks and enhanced multi-frame functional groups are checked for
+  duplicate positions, missing/irregular slice steps, mixed orientations,
+  inconsistent pixel sizes, non-spatial frame order and sheared grids before
+  decoding. Unsupported grids are rejected instead of averaging their spacing.
+- Loaded cases retain the DICOM direction matrix. NIfTI input to the model
+  includes that direction, spacing and origin.
+- Returned canonical labels are resampled onto the original input grid using
+  nearest-neighbor interpolation.
+- Projects record the XYZ-to-LPS affine and a patient-space copy of centerlines.
+  Existing viewer and editing coordinates remain legacy ZYX millimetres.
+- Arc-length resampling interpolates at the requested interval instead of
+  skipping original vertices.
+- New contour series store rotation-minimizing frames. Image sampling and
+  both automatic and manual contour conversion use those same frames.
+  Old series without frames retain their previous sampling basis.
+- The CTA radial half-height method measures lumen contours and rejects missing
+  edges, unenhanced centers and bright outer peaks. It is available in the
+  editor and used for automatic CTA drafts.
+- Failed automatic 2D segmentation no longer silently inserts a circle.
+- The editor displays lumen area, equivalent diameter and minimum/maximum
+  Feret diameters. A diameter-ratio NASCET estimate requires explicit operator
+  selection of a normal distal ICA reference and an ICA lesion. Invalid rings
+  and estimated circle contours cannot be used. This is not a validated
+  clinical NASCET measurement method or an automatic near-occlusion detector.
+- A longitudinal profile plots area at each measured section, with explicit
+  gaps and navigation to the minimum area or minimum Feret diameter in a
+  selected range. Minima are not automatically classified as ICA stenoses.
+- Trapezoidal section integrals estimate lumen, annular and high-density volumes
+  over covered intervals only. Outputs include covered/selected lengths and
+  excluded intervals. Missing contours, estimated circles, excessive sample
+  gaps and tangent changes above 30 degrees are excluded. High-density totals
+  require identical HU/component-size parameters throughout the selected range.
+  These are sampled estimates, not voxel-mask volumes or plaque composition.
+- Batch outer-wall detection processes unfilled sections, retains existing
+  boundaries, reports failed sections and can stop after the current request.
+  Outer-wall annotations can be removed independently of the lumen.
+- Worker inference runs outside the event loop, rejects concurrent jobs, and
+  configures PyTorch threading once per process.
+- HTTP errors from the worker preserve their actual details.
+- CFD averaging interpolates the exact start of the final recorded cardiac
+  period instead of dropping its boundary sample. Partial runs are explicitly
+  identified. Two full cycles are compared using phase-aligned global RMS of
+  WSS vectors and pressure, with absolute differences and a stated 5% tolerance.
+  Source intervals larger than one tenth of a cycle prevent a positive
+  periodicity assessment. Agreement is not a claim of solver/mesh validation.
+- CFD extraction verifies wall node IDs, coordinates/units and field dimensions
+  on every snapshot. Invalid/missing/nonfinite fields and mismatched node
+  ordering are rejected. OSI at zero WSS has an explicit validity mask.
+- The SU2 boundary-normal sign is corrected: the wrapper returns inward
+  normals, which must be negated for outward flux. This was verified against
+  the installed SU2 source and a runtime duct-normal probe. The correction
+  applies both to RCR input flows and diagnostics.
+- The runner records same-state inlet/outlet flux estimates after each solve,
+  reverse-flow indicators and pressure-clamp events in `boundary_flows.csv`.
+  Postprocessing reports last-cycle integrated volumes and absolute imbalance;
+  the estimate uses boundary nodal velocities, not conservative numerical
+  fluxes from the solver, so it is not a residual convergence certificate.
+
+- Experimental sectional plaque composition (`server/plaque_composition.py`)
+  splits the wall region into calcified, low-attenuation (atheromatous
+  candidate) and fibrous pixels by HU. The calcium threshold is at least
+  1.3x the median lumen HU, so a bright lumen is never called calcium;
+  calcium inside the lumen contour is counted as plaque and reported. Pixels
+  of 150 HU and above outside the lumen (blurred contrast) and below -50 HU
+  (fat/air) are excluded. Low-attenuation pixels within 0.5 mm of the outer
+  wall are not called atheroma. Volumes use the same coverage-limited
+  section integral. The outer-wall search now ignores edges whose inner side
+  exceeds 100 HU; previously it locked onto the blurred lumen edge on real
+  CTA and failed on every section. HU bands are approximations: no
+  histological or clinical validation; a normal wall is reported as fibrous.
+
+- Threshold lumen contours on CTA exclude wall calcium: pixels at or above
+  max(1.3x the first-pass lumen median, 500 HU) are cut, so bulb contours no
+  longer swallow calcified plaque. The absolute floor protects dim, obliquely
+  cut sections. "Auto" accepts the resulting notch when the concavity is
+  calcium (upper quartile at the cut); other irregular shapes are rejected.
+- The outer-wall search starts beyond the outermost lumen crossing (notched
+  lumens) and is carried by smoothness through the blurred-lumen zone behind
+  calcium instead of failing. On the reference case walls were found on 82
+  of 83 ICA and 56 of 57 ECA sections (previously none in the bulb).
+- Low-attenuation pixels continuous with tissue outside the wall contour
+  (more than 2 mm^2 outside) are perivascular, not atheroma, and are excluded
+  from plaque. On the reference case this removed fat between the CCA and
+  trachea that had been reported as ~114 mm^3 of atheroma.
+- Wall analyses store their section frame; the 3D path preview places
+  calcified and atheromatous pixels in 3D, and the longitudinal profile has
+  CCA / bifurcation / ICA / ECA range buttons for per-part volumes.
+
+- Plaque is segmented only in a stenosis zone (`.../plaque_zone`): outer
+  wall and composition are found on the chosen sections and removed
+  elsewhere on the branch, since on a normal segment the HU bands would report
+  normal wall as fibrous plaque. The editor suggests the zone as sections
+  within +/-10 mm (adjustable) of the narrowest lumen; the operator confirms
+  or edits it. The narrowest lumen is not a validated stenosis detector: a
+  naturally small distal artery can be narrower than a mild lesion.
+
+- First calibration against operator contours (`scripts/calibration_report.py`,
+  one study, 9 manual lumen sections, one operator). The operator's boundary
+  lies at a median 0.65x the centre HU. The threshold floor was raised from
+  0.4x to 0.65x the seed HU: median Dice 0.73 -> 0.91, median area error
+  +73% -> +19% (+9% outside the skull base). The radial half-height (FWHM)
+  method took its background from the far end of each ray, which on this
+  study was usually another contrast-filled vessel, so it failed on every
+  section; the background is now the darkest point beyond the core (7 of 9
+  sections measured, Dice 0.88). In the petrous carotid canal all automatic
+  methods leak into the surrounding bone (area 2-3x the operator's); that is
+  not fixed by calibration. Nine sections from one patient are too few to
+  generalize; repeat with more reference sections and operators.
+
+- CFD numerics checked on a steady Poiseuille tube (R 3 mm, 90 mm, Re ~90),
+  built by the app's own surface and mesh pipeline and, as a control, from an
+  analytic cylinder. Three defects were found and fixed:
+  1. WSS was half its true value everywhere. SU2 divides wall shear by the
+     reference dynamic pressure, which is 1 Pa for our dimensional runs with
+     zero initial velocity, so `Skin_Friction_Coefficient` already is WSS in
+     Pa; the old `0.5 * Cf` convention halved WSS, TAWSS and doubled RRT (OSI
+     is unaffected). `su2_postprocess.skin_friction_scale_pa` now follows
+     SU2's own rule from each run's `run.cfg`. Results computed before this
+     change must be post-processed again.
+  2. TetGen ignored the requested element size (`maxvolume` needs
+     `fixedvolume`), so volume meshes were ~6x coarser than 0.4 mm.
+  3. Inlet/outlet caps were a plain polygon triangulation: long thin
+     triangles whose control volumes decoupled pressure from velocity
+     (pressure gradient 47x the analytic value with first order; second
+     order did not converge). Caps are now near-equilateral discs
+     (`su2_export._disc_cap`), with the old methods as fallbacks.
+  With these, second-order convection (MUSCL + Venkatakrishnan), now the
+  default, gives dp/dx +19% and WSS -3% against Poiseuille on the app's own
+  tube mesh (+7% / -5% on the analytic mesh); first order overstated dp/dx
+  3-4x. The steady tube does not test pulsatile timing or the Windkessel
+  outlets.
+
+## Remaining implementation and validation
+
+0. Complete migration of legacy annotations/surfaces to LPS; resampling or
+   explicit contiguous-stack selection for rejected irregular/sheared DICOM
+   series; optional isotropic processing grids restricted to ROI.
+1. Validate Fast seeds and component filtering on representative CTA.
+2. Validate ICA/ECA labeling and endpoint selection; implement explicit
+   bifurcation uncertainty instead of assuming every tree is anatomically valid.
+3. Expose MPR sampling parameters and verify all real-case reformats.
+4. Validate the radial method on stenoses; longitudinal intensity reference and
+   confidence-aware smoothing must preserve genuine diameter minima.
+5–7. Experimental sectional outer-wall proposals use cyclic radial optimization,
+   edge-support and search-limit rejection. The editor overlays the proposed
+   boundary and high-density components with an explicit CTA HU threshold;
+   results/parameters persist and are invalidated by lumen edits.
+   Manual outer-wall tracing is supported when detection fails, with checks
+   for nested nonintersecting rings. Manual results carry no detector confidence.
+   Sectional areas remain 2D; longitudinal integrals are coverage-limited
+   estimates, not validated calcium volumes. Plaque-component classification,
+   longitudinal wall regularization and expert validation remain pending.
+   Contrast CTA must not use 130 HU as an unconditional calcium threshold.
+   Estimated wall thickness must not be represented as a measured boundary.
+   The implemented NASCET estimate needs validation against expert measurements;
+   it requires an explicitly selected normal distal ICA reference.
+8. Ophthalmic artery tracing and optional outlet support are NOT implemented.
+9. Surface/volume meshing exists; prism boundary layers and three-level mesh
+   convergence are not established by this change.
+10. SU2 export/run/postprocessing and sampled cycle comparison exist. Outlet
+    calibration, mass balance, mesh/time-step convergence and real-run periodic
+    convergence remain unverified. The existing 0.5 skin-friction-to-WSS scale
+    remains a project convention pending independent dimensional verification.
+    The web interface can now proxy a native macOS API with verified
+    SU2/pysu2/MPI imports and custom-boundary methods. A four-step synthetic
+    duct run completed through the normal solver and postprocessing chain.
+    Subsequent 600-step duct runs with corrected flux signs showed no reverse
+    flow in the last cycle and about 2% cycle-to-cycle WSS RMS differences,
+    but boundary nodal-flux imbalance remained about 23% (20 inner iterations)
+    and 20% (80 inner iterations). These runs do not establish mass conservation
+    or physiological validity; conservative boundary-flux extraction and mesh/
+    boundary-condition verification remain open.
+    This establishes execution/output compatibility, not patient CFD accuracy
+    or periodic convergence. See `docs/NATIVE_CFD.md` for startup and rollback.
+11. Expert-reference Dice/HD95, observer repeatability and CFD sensitivity runs
+    require reference segmentations and completed simulation experiments.
+
+## Checks
+
+`python -m pytest -q tests server/tests` and `npm run build` in `frontend`.
+Geometry tests include asymmetric labels through NIfTI canonicalization,
+rotated/reflected LPS transforms and pixel-center MPR consistency.
+
+Header-only checks of the local studies found regular grids in the 379-slice
+and 238-slice series. The 269-file series has 267 intervals of 1 mm and one
+interval of 59 mm; it is rejected until a contiguous stack is explicitly
+selected or the source series is corrected. This check does not establish
+segmentation accuracy.

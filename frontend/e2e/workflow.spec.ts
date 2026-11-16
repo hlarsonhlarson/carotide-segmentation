@@ -50,29 +50,69 @@ test("synthetic study: image, path, contours, mesh, persistence and UI", async (
   await post(base + "/save/project");
   const opened = await post("/projects/open", { path: project });
   expect(opened.restored.right.mesh_files_exist).toBe(true);
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.setViewportSize({ width: 1660, height: 1000 });
   await page.goto(host);
+  await page
+    .getByRole("button", { name: "Открыть сохранённый проект…" })
+    .click();
   await page.getByLabel("Папка проекта").fill(project);
   await page
     .getByRole("button", { name: "Открыть проект", exact: true })
     .click();
-  await expect(
-    page.getByRole("heading", { name: "Путь сосуда", exact: true }),
-  ).toBeVisible();
-  await expect(page.getByText("Контрольные точки: 3")).toBeVisible();
-  await page.getByLabel("Плоскость").selectOption("coronal");
-  await expect(page.getByAltText("DICOM-срез")).toBeVisible();
-  await page.getByRole("button", { name: "Геометрия", exact: true }).click();
-  await page.getByRole("button", { name: "Показать сохранённую геометрию" }).click();
-  await expect(page.locator("canvas")).toBeVisible();
-  await page.screenshot({path: "/private/tmp/carotige-geometry.png", fullPage: true});
-  await page.getByRole("button", { name: "Расчёт", exact: true }).click();
+  await expect(page.locator(".slice-pane")).toHaveCount(3);
+  await expect(page.locator(".point-card")).toHaveCount(3);
+  await expect(page.locator(".path-canvas canvas")).toBeVisible();
+  await page.getByRole("button", { name: "Поверхность…", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Показать сохранённую геометрию" })
+    .click();
+  await expect(page.locator("dialog canvas")).toBeVisible();
+  await page.getByRole("button", { name: "Закрыть окно" }).click();
+  await page
+    .getByRole("button", { name: "CFD Computation…", exact: true })
+    .click();
   await expect(
     page.getByRole("button", { name: "Запустить CFD", exact: true }),
   ).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("dialog")).not.toBeVisible();
   await page.screenshot({
-    path: "/private/tmp/carotige-workbench.png",
+    path: "../data/runtime/native-style-workbench.png",
     fullPage: true,
   });
+  // Switching branches keeps the three slice positions; left/right data stays independent.
+  await page.getByRole("button", { name: "CCA → ECA", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Разметить путь", exact: true })
+    .click();
+  const svg = page.locator(".coronal svg");
+  // Convert voxel display coordinates through the actual SVG transform, including letterboxing.
+  await page
+    .getByRole("button", { name: "Увеличить: Корональная", exact: true })
+    .click();
+  const screen = await svg.locator("g").evaluate((el) => {
+    const p = new DOMPoint(16.5, 19.5).matrixTransform(
+      (el as SVGGElement).getScreenCTM()!,
+    );
+    return { x: p.x, y: p.y };
+  });
+  await page.mouse.click(screen.x, screen.y);
+  await expect(page.locator(".point-card")).toHaveCount(4);
+  const controls = await get("/cases/" + opened.case_id + "/control_points");
+  expect(controls["right:cca_eca"]).toEqual([[20, 16, 16]]);
+  await page.getByRole("button", { name: "Левая", exact: true }).click();
+  await expect(page.locator(".point-card")).toHaveCount(0);
+  await page.getByRole("button", { name: "Правая", exact: true }).click();
+  await expect(page.locator(".point-card")).toHaveCount(4);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  expect(errors).toEqual([]);
   const mutation = await request.delete(
     host + "/api" + base + "/segment/right/cca_ica/point/0",
   );

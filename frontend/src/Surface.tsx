@@ -7,14 +7,16 @@ export function Surface({
   base,
   side,
   onError,
+  initialKind = "surface",
 }: {
+  initialKind?: string;
   base: string;
   side: string;
   onError: (s: string) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const [version, setVersion] = useState(0),
-    [kind, setKind] = useState("surface"),
+    [kind, setKind] = useState(initialKind),
     [busy, setBusy] = useState(false),
     [status, setStatus] = useState("");
   const url =
@@ -26,19 +28,24 @@ export function Surface({
     const parent = host.current;
     let stopped = false;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color("#101925");
+    scene.background = new THREE.Color("#344152");
     const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 10000);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     parent.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.DOLLY,
+    };
     scene.add(new THREE.HemisphereLight(0xffffff, 0x36495c, 3));
     const light = new THREE.DirectionalLight(0xffffff, 3);
     light.position.set(1, 2, 3);
     scene.add(light);
     let geometry: THREE.BufferGeometry | undefined;
     const material = new THREE.MeshStandardMaterial({
-      color: 0x58cbb8,
+      color: 0xdbe3ee,
       roughness: 0.5,
       side: THREE.DoubleSide,
     });

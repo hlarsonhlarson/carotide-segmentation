@@ -26,3 +26,6 @@ frontend/dist/
 data/
 test-results/
 playwright-report/
+
+# Local QA studies and simulation artifacts
+qa_runs/

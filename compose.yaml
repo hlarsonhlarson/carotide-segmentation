@@ -6,6 +6,7 @@ services:
     environment:
       CAROTID_DICOM_ROOT: /data/dicom
       CAROTID_PROJECTS_ROOT: /data/projects
+      CAROTID_AUTOSEED_WORKER_URL: ${CAROTID_AUTOSEED_WORKER_URL:-http://host.docker.internal:8011/segment}
     volumes:
       - ${DICOM_DIR:-./data/dicom}:/data/dicom:ro
       - ${PROJECTS_DIR:-./data/projects}:/data/projects

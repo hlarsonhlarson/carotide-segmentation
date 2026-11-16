@@ -13,7 +13,7 @@ import math
 
 import numpy as np
 from scipy import ndimage as ndi
-from skimage import measure, segmentation
+from skimage import feature, measure, segmentation
 
 CENTER_SAMPLE_RADIUS_PX = 2
 # A contrast-opacified lumen vs. the muscle/fat/air around it is a huge,
@@ -25,8 +25,16 @@ CENTER_SAMPLE_RADIUS_PX = 2
 # in-lumen HU variation/noise. CT_MIN_ABSOLUTE_FLOOR_HU guards the low
 # end for a weak/borderline seed (where the ratio alone would barely
 # exclude anything) and keeps air/fat out regardless.
-CT_RELATIVE_FLOOR_RATIO = 0.4
+# Calibrated against operator contours (manual reference series, 9 sections, 2026-11):
+# the operator's lumen boundary sits at a median 0.65x the centre HU. At 0.4
+# the threshold lumen was 50% larger than the operator's on good sections; at
+# 0.65 it is +9% (Dice 0.94). 0.7 fitted slightly better (+3%) but cuts real
+# lumen sooner where the centre is brighter than the periphery; more reference
+# sections are needed before going further.
+CT_RELATIVE_FLOOR_RATIO = 0.65
 CT_MIN_ABSOLUTE_FLOOR_HU = 100.0
+CT_CALCIUM_OVER_LUMEN = 1.3
+CT_CALCIUM_MIN_HU = 500.0
 # VERIFIED against a synthetic lumen/muscle test: a lower floor (0.15x
 # seed / 20 HU absolute) sounds right for "an order of magnitude lower"
 # in the abstract, but real neck muscle sits at ~40-60 HU — only ~5-7x
@@ -48,6 +56,12 @@ LEVELSET_GRADIENT_SIGMA = 1.0
 # for the actual failure mode in both directions: a real cliff (order-of-
 # magnitude HU drop) stops it; ordinary in-lumen noise/partial volume at
 # the seed's own scale does not.
+
+
+def _center_component(binary: np.ndarray, center_px):
+    labeled, _ = ndi.label(binary, structure=np.ones((3, 3)))
+    label_id = labeled[int(round(center_px[0])), int(round(center_px[1]))]
+    return None if label_id == 0 else labeled == label_id
 
 
 def _center_contour(binary: np.ndarray, center_px):
@@ -78,6 +92,20 @@ def threshold_contour(slice_2d: np.ndarray, center_px, modality: str, max_radius
         seed_hu = float(np.median(sample))
         floor = max(seed_hu * CT_RELATIVE_FLOOR_RATIO, CT_MIN_ABSOLUTE_FLOOR_HU) if seed_hu > 0 else CT_MIN_ABSOLUTE_FLOOR_HU
         binary = slice_2d >= floor
+        # Wall calcium is brighter than the opacified lumen (~1.5x and more on
+        # real CTA, lumen p99 ~1.05x its median). Including it made bulb
+        # contours swallow calcified plaque and overstated lumen area. The
+        # reference is the median of the whole first-pass lumen, not the
+        # small centre sample, which can sit in a darker mixing or oblique
+        # region and would then cut real lumen away.
+        first = _center_component(binary & (np.hypot(*np.mgrid[0:slice_2d.shape[0], 0:slice_2d.shape[1]]
+                                                     - np.array([cy, cx])[:, None, None]) <= max_radius_px), (cy, cx))
+        if first is not None:
+            reference = max(seed_hu, float(np.median(slice_2d[first])))
+            if reference > 0:
+                # Obliquely cut or poorly opacified sections have a dim
+                # lumen; a purely relative cut would remove real lumen there.
+                binary &= slice_2d < max(reference * CT_CALCIUM_OVER_LUMEN, CT_CALCIUM_MIN_HU)
     else:
         thresh = float(np.percentile(slice_2d, MR_LOCAL_PERCENTILE))
         binary = slice_2d > thresh
@@ -91,8 +119,121 @@ def threshold_contour(slice_2d: np.ndarray, center_px, modality: str, max_radius
     dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
     binary = binary & (dist <= max_radius_px)
 
+    binary = _cut_thin_bridges(binary, (cy, cx))
+    binary = _split_at_waist(binary, (cy, cx))
     contour = _center_contour(binary, (cy, cx))
     return contour  # list of [row, col] float pixel coords, or None
+
+
+# A neighbouring bright vessel (jugular, ECA branch, small vein) often touches
+# the lumen through a partial-volume bridge only a few pixels wide; plain
+# connected-component growth then swallows it. Necks narrower than this
+# fraction of the lumen's inscribed diameter are cut.
+BRIDGE_CUT_FRACTION = 0.7
+BRIDGE_CENTER_SEARCH_PX = 3
+
+
+def _disk(radius: int) -> np.ndarray:
+    yy, xx = np.mgrid[-radius:radius + 1, -radius:radius + 1]
+    return (yy ** 2 + xx ** 2) <= radius ** 2
+
+
+def _cut_thin_bridges(binary: np.ndarray, center_px):
+    """Keep the centre component without appendages joined by a thin neck.
+
+    Opening with a disk of half the lumen's inscribed radius removes necks
+    narrower than that disk; the surviving core is grown back by the same
+    disk inside the original mask, so the lumen's own outline is preserved.
+    """
+    cy, cx = center_px
+    labeled, _ = ndi.label(binary, structure=np.ones((3, 3)))
+    label_id = labeled[cy, cx]
+    if label_id == 0:
+        return binary
+    component = labeled == label_id
+    edt = ndi.distance_transform_edt(component)
+    r = BRIDGE_CENTER_SEARCH_PX
+    window = edt[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1]
+    radius = int(math.floor(float(window.max()) * BRIDGE_CUT_FRACTION))
+    if radius < 1:
+        return component
+    footprint = _disk(radius)
+    core = ndi.binary_opening(component, structure=footprint)
+    core_labels, _ = ndi.label(core, structure=np.ones((3, 3)))
+    near = core_labels[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1]
+    ids = near[near > 0]
+    if ids.size == 0:
+        return component
+    core = core_labels == np.bincount(ids).argmax()
+    return component & ndi.binary_dilation(core, structure=footprint)
+
+
+# Two touching vessels can share a contact wider than a "thin bridge". A
+# distance-transform watershed separates them at the waist; neighbouring
+# basins are merged back unless the waist is clearly narrower than both.
+WAIST_RATIO = 0.8
+WAIST_MIN_PEAK_DISTANCE_PX = 3
+
+
+def _split_at_waist(binary: np.ndarray, center_px):
+    cy, cx = center_px
+    labeled, _ = ndi.label(binary, structure=np.ones((3, 3)))
+    label_id = labeled[cy, cx]
+    if label_id == 0:
+        return binary
+    component = labeled == label_id
+    edt = ndi.distance_transform_edt(component)
+    peaks = feature.peak_local_max(edt, min_distance=WAIST_MIN_PEAK_DISTANCE_PX,
+                                   labels=component.astype(np.int32), exclude_border=False)
+    if len(peaks) < 2:
+        return component
+    markers = np.zeros(edt.shape, dtype=np.int32)
+    markers[tuple(peaks.T)] = np.arange(1, len(peaks) + 1)
+    basins = segmentation.watershed(-edt, markers, mask=component)
+    peak_of = ndi.maximum(edt, basins, index=np.arange(1, len(peaks) + 1))
+    peak_of = dict(zip(range(1, len(peaks) + 1), peak_of))
+    keep = {int(basins[cy, cx])}
+    if 0 in keep:
+        return component
+    frontier = list(keep)
+    while frontier:
+        region = frontier.pop()
+        inside = basins == region
+        ring = ndi.binary_dilation(inside, structure=np.ones((3, 3))) & ~inside & component
+        for other in np.unique(basins[ring]):
+            other = int(other)
+            if other == 0 or other in keep:
+                continue
+            touching = ring & (basins == other)
+            waist = float(edt[touching].max())
+            if waist >= WAIST_RATIO * min(peak_of[region], peak_of[other]):
+                keep.add(other)
+                frontier.append(other)
+    return np.isin(basins, list(keep))
+
+
+def calcium_notch(slice_2d: np.ndarray, contour_px) -> bool:
+    """True when the concavity of a CT lumen contour is filled by calcium.
+
+    Excluding wall calcium leaves a notch that lowers the contour's
+    compactness although the lumen itself is well defined. The region
+    between the contour and its convex hull is calcium when its upper
+    quartile reaches the calcium cut used by threshold_contour.
+    """
+    from scipy.spatial import ConvexHull
+    from skimage.draw import polygon
+    contour = np.asarray(contour_px, dtype=float)
+    if len(contour) < 3:
+        return False
+    hull = contour[ConvexHull(contour).vertices]
+    inside, hull_mask = (np.zeros(slice_2d.shape, dtype=bool) for _ in range(2))
+    inside[polygon(contour[:, 0], contour[:, 1], slice_2d.shape)] = True
+    hull_mask[polygon(hull[:, 0], hull[:, 1], slice_2d.shape)] = True
+    notch = hull_mask & ~inside
+    if notch.sum() < 4 or not inside.any():
+        return False
+    cut = max(float(np.median(slice_2d[inside])) * CT_CALCIUM_OVER_LUMEN, CT_CALCIUM_MIN_HU)
+    return float(np.percentile(slice_2d[notch], 75)) >= cut
 
 
 def levelset_contour(slice_2d: np.ndarray, center_px, initial_radius_px: float,

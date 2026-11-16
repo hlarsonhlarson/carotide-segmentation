@@ -17,12 +17,14 @@ DIMENSIONAL, CFL=1 first-order for stability, etc).
 import json
 import logging
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
-import signal
-from .config import SU2_BIN_DIR, MPI_PYTHON
 from pathlib import Path
+
+from .config import SU2_BIN_DIR, MPI_PYTHON
 
 import numpy as np
 
@@ -32,22 +34,48 @@ log = logging.getLogger("carotid_server")
 
 RUNNER_SCRIPT = str(Path(__file__).resolve().parent / "su2_pulsatile_runner.py")
 
-# Run for this many cardiac cycles — matches the number the standalone
-# pipeline's own real runs used (reaches periodic near-steady-state within
-# this with the small Windkessel compliance calibrate_two_outlet_rcr uses
-# by default; see that module's own docstring). TIME_STEP_S/INNER_ITER/
-# CFL_NUMBER/fluid properties are likewise carried over unchanged from
-# every validated real run in that pipeline.
-N_CARDIAC_CYCLES = 2
+# Three cycles: the first carries the start-up transient from rest, and the
+# periodicity check (cfd_temporal.cycle_quality) compares the last two. With
+# two, every result was reported as "insufficient cycles" and averaged over
+# the cycle right after the start-up. TIME_STEP_S/INNER_ITER/CFL_NUMBER/fluid
+# properties come from the original pipeline (see notes below each).
+N_CARDIAC_CYCLES = 3
 TIME_STEP_S = 0.005
-INNER_ITER = 20
-CFL_NUMBER = 1.0
+# With MUSCL the inner residual stops falling after ~6-8 iterations. Over a
+# full cycle on a 128k-node carotid mesh, 10 vs 20 inner iterations differed
+# by 0.6% in WSS and velocity, 1-2% in outlet flow and 0.1 mmHg in pressure,
+# at half the cost per step.
+INNER_ITER = 10
+# Pseudo-time CFL of the implicit inner iterations. At 1.0 (carried over from
+# the original pipeline) 20 inner iterations reduced the residual by only
+# ~0.14 decades per physical step; on a real carotid mesh fluid accumulated
+# inside and both outlets showed inflow (boundary imbalance 160-380%). At 200
+# the outlets carry the inflow and the nodal-flux imbalance falls to ~20%, the
+# level of the straight-duct check. Re-verify on new meshes.
+CFL_NUMBER = 200.0
+# Second-order convection. A Poiseuille tube built by this app's own
+# surface/mesh pipeline (2026-11): first-order upwinding overstated the
+# pressure gradient 3-4x even on a clean mesh; MUSCL with the Venkatakrishnan
+# limiter came within +19% (dp/dx) and -3% (WSS) of the analytic values,
+# +7%/-5% on an ideal analytic mesh. It needs well-shaped inlet/outlet caps
+# (su2_export._disc_cap): with the old polygon caps it did not converge.
+MUSCL_FLOW = "YES"
+SLOPE_LIMITER_FLOW = "VENKATAKRISHNAN"
 FLUID_DENSITY_KG_M3 = 1050.0
 FLUID_VISCOSITY_PAS = 0.0035
 MMHG_TO_PA = 133.322
 
 
 def mpi_processes() -> int:
+    # Multi-rank OpenMPI on macOS hung in MPI_Win_create with osc=sm; with
+    # osc=rdma and the default shared-memory transport it runs, and 8 ranks
+    # cut a 128k-node step from ~16 s (1 rank) to ~6 s. Without rdma stay on
+    # one rank. CAROTID_MPI_N overrides either way.
+    override = os.environ.get("CAROTID_MPI_N")
+    if override:
+        return max(1, int(override))
+    if sys.platform == "darwin" and os.environ.get("OMPI_MCA_osc") != "rdma":
+        return 1
     return max(1, min(8, os.cpu_count() or 4))
 
 
@@ -98,8 +126,8 @@ INNER_ITER= {INNER_ITER}
 NUM_METHOD_GRAD= GREEN_GAUSS
 CFL_NUMBER= {CFL_NUMBER}
 CONV_NUM_METHOD_FLOW= FDS
-MUSCL_FLOW= NO
-SLOPE_LIMITER_FLOW= NONE
+MUSCL_FLOW= {MUSCL_FLOW}
+SLOPE_LIMITER_FLOW= {SLOPE_LIMITER_FLOW}
 TIME_DISCRE_FLOW= EULER_IMPLICIT
 LINEAR_SOLVER= FGMRES
 LINEAR_SOLVER_PREC= ILU
@@ -164,6 +192,12 @@ def run_in_background(job: dict, run_dir: Path, cfg_path: Path, params_path: Pat
         return
     env = os.environ.copy()
     env["PYTHONPATH"] = SU2_BIN_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    # macOS OpenMPI/PMIx: listener bind and RDMA one-sided windows hang
+    # without these. Keep any values the operator already exported.
+    env.setdefault("OMPI_MCA_btl", "self,tcp")
+    env.setdefault("OMPI_MCA_pml", "ob1")
+    env.setdefault("OMPI_MCA_osc", "sm")
+    env.setdefault("PMIX_MCA_gds", "hash")
     n_procs = mpi_processes()
     cmd = ["mpirun", "-n", str(n_procs), MPI_PYTHON, RUNNER_SCRIPT, str(cfg_path), str(params_path)]
     job["cmd"] = " ".join(cmd)

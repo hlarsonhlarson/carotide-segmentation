@@ -103,6 +103,7 @@ final class MeshAnnotationOverlayModel: ObservableObject {
 @MainActor
 final class SurfacePreviewCoordinator: NSObject, SCNSceneRendererDelegate {
     var cameraNode: SCNNode?
+    var surfaceNode: SCNNode?
     let dragHandler = OrbitCameraDragHandler()
 
     // Annotation live-projection (mesh preview only, nil elsewhere) —
@@ -140,10 +141,9 @@ final class SurfacePreviewCoordinator: NSObject, SCNSceneRendererDelegate {
     }
 }
 
-/// Renders a parsed STL's geometry directly — a one-shot build, not a
-/// per-frame-rebuilt preview like the path/segmentation panes (the
-/// surface doesn't change while this sheet is open), so there's no
-/// signature-diffing to skip redundant rebuilds here.
+/// Renders a surface while preserving its camera between updates. STL
+/// previews stay fixed; CFD results can replace the color source
+/// while retaining the camera and the mesh's vertex/index sources.
 struct SurfaceGeometryView: NSViewRepresentable {
     let geometry: SCNGeometry
     var controller: Scene3DController?
@@ -178,6 +178,7 @@ struct SurfaceGeometryView: NSViewRepresentable {
 
         guard let scene = view.scene else { return view }
         let node = SCNNode(geometry: geometry)
+        context.coordinator.surfaceNode = node
         scene.rootNode.addChildNode(node)
 
         let (center, radiusFloat) = node.boundingSphere
@@ -207,7 +208,12 @@ struct SurfaceGeometryView: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: Interactive3DSceneView, context: Context) {}
+    func updateNSView(_ nsView: Interactive3DSceneView, context: Context) {
+        if let node = context.coordinator.surfaceNode, node.geometry !== geometry {
+            node.geometry = geometry
+            nsView.needsDisplay = true
+        }
+    }
 
     /// Builds the real 3D leader-line + anchor-dot geometry for every
     /// cap diameter and inter-cap angle the mesh-geometry endpoint

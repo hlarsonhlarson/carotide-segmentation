@@ -6,12 +6,13 @@ shear index (OSI), relative residence time (RRT), and pressure — plus the
 wall/cap geometry stats (areas, diameters, branch lengths) a "sizes and
 volumes" panel needs.
 
-Field extraction follows the same convention the validated standalone
-pipeline's own extractor used (~/Desktop/SU2 Pipeline Code/shared/
-extract_generic.py): WSS magnitude [Pa] = 0.5 * |Skin_Friction_Coefficient|
-— SU2's own dimensional output under INC_NONDIM=DIMENSIONAL already scales
-this by density/velocity internally, and the 0.5 factor is this project's
-own established convention from real validated runs, not re-derived here.
+WSS [Pa] = Skin_Friction_Coefficient * q_ref (see skin_friction_scale_pa):
+SU2 divides wall shear by the reference dynamic pressure, which for the
+incompressible solver with INC_NONDIM=DIMENSIONAL is 0.5*rho*|v_init|^2,
+replaced by 1 when that is ~0 (CIncEulerSolver::SetReferenceValues). Our
+runs start from zero velocity, so Cf already is WSS in Pa. The earlier
+0.5*Cf convention halved every WSS; verified on a Poiseuille tube
+(|Cf| 0.20 Pa vs analytic 0.21 Pa).
 
 OSI (oscillatory shear index) and RRT (relative residence time) are
 standard derived hemodynamic metrics from the literature (CONFIRMED
@@ -32,9 +33,12 @@ import logging
 import re
 from pathlib import Path
 
+import json
+
 import numpy as np
 import vtk
 from vtk.util import numpy_support
+from .cfd_temporal import validate_series, last_window, cycle_quality
 
 log = logging.getLogger("carotid_server")
 
@@ -57,8 +61,17 @@ def _wall_point_indices(surf, wall_face_id: int = 1):
     wall-tagged triangle, and that triangle connectivity re-indexed into
     the compact wall-only point list (0..len(wall)-1) for building a
     standalone wall-surface mesh to send to the client."""
-    face_ids = numpy_support.vtk_to_numpy(surf.GetCellData().GetArray("ModelFaceID"))
-    gid = numpy_support.vtk_to_numpy(surf.GetPointData().GetArray("GlobalNodeID"))
+    face_array = surf.GetCellData().GetArray("ModelFaceID")
+    node_array = surf.GetPointData().GetArray("GlobalNodeID")
+    if face_array is None or node_array is None:
+        raise ValueError("CFD surface requires ModelFaceID and GlobalNodeID")
+    face_ids = numpy_support.vtk_to_numpy(face_array)
+    gid = numpy_support.vtk_to_numpy(node_array)
+    if (gid.shape != (surf.GetNumberOfPoints(),) or not np.isfinite(gid).all()
+            or np.any(gid < 1) or np.any(gid != np.floor(gid)) or len(np.unique(gid)) != len(gid)):
+        raise ValueError("CFD surface has invalid or duplicate GlobalNodeID values")
+    if face_ids.shape != (surf.GetNumberOfCells(),):
+        raise ValueError("CFD surface has invalid ModelFaceID values")
     wall_cells = np.nonzero(face_ids == wall_face_id)[0]
     if len(wall_cells) == 0:
         raise ValueError("no wall-tagged triangles in this surface")
@@ -69,6 +82,8 @@ def _wall_point_indices(surf, wall_face_id: int = 1):
     local_of = {}
     for ci in wall_cells:
         cell = surf.GetCell(int(ci))
+        if cell.GetNumberOfPoints() != 3:
+            raise ValueError("CFD wall surface must contain triangles")
         ids = [cell.GetPointId(k) for k in range(3)]
         tri = []
         for lid in ids:
@@ -91,6 +106,28 @@ def _flow_files_sorted(run_dir: Path):
     return list(zip(files, steps))
 
 
+def skin_friction_scale_pa(run_dir) -> float:
+    """Reference dynamic pressure SU2 divided wall shear by (Pa), read from
+    the run's own run.cfg; mirrors CIncEulerSolver::SetReferenceValues."""
+    cfg = Path(run_dir) / "run.cfg"
+    values = {}
+    if cfg.is_file():
+        for line in cfg.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("%"):
+                key, value = line.split("=", 1)
+                values[key.strip().upper()] = value.strip()
+    def vec(text):
+        return [float(v) for v in text.strip("() ").replace(",", " ").split()] if text else [0.0]
+    if values.get("INC_NONDIM", "INITIAL_VALUES").upper() in ("DIMENSIONAL", "INITIAL_VALUES"):
+        density = float(values.get("INC_DENSITY_INIT", 1.2229))
+        speed2 = sum(v * v for v in vec(values.get("INC_VELOCITY_INIT", "(1, 0, 0)")))
+    else:
+        density = float(values.get("INC_DENSITY_REF", 1.0))
+        speed2 = float(values.get("INC_VELOCITY_REF", 1.0)) ** 2
+    q = 0.5 * density * speed2
+    return q if q >= 1e-16 else 1.0
+
+
 def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float, on_frame=None):
     """Reads every flow_*.vtu snapshot SU2 wrote for this run and builds
     the wall-only surface (points in mm, triangles) plus per-frame WSS
@@ -106,10 +143,23 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
     with tempfile.TemporaryDirectory(prefix="su2_post_") as tmp:
         surf = _read_vtp_from_bytes(vtp_bytes, Path(tmp))
     wall_vol_idx, triangles = _wall_point_indices(surf)
+    surface_ids = numpy_support.vtk_to_numpy(surf.GetPointData().GetArray("GlobalNodeID"))
+    order = np.argsort(surface_ids)
+    surface_local = order[np.searchsorted(surface_ids[order], wall_vol_idx + 1)]
+    expected_points_mm = numpy_support.vtk_to_numpy(surf.GetPoints().GetData())[surface_local]
+    if not np.isfinite(time_step_s) or time_step_s <= 0:
+        raise ValueError("CFD output time step must be positive")
 
     files = _flow_files_sorted(run_dir)
     if not files:
         raise ValueError(f"no flow_*.vtu snapshots found in {run_dir}")
+    # Runs since the gauge-pressure change solve relative to a reference
+    # pressure (see su2_pulsatile_runner.py); older runs have no file.
+    reference_file = Path(run_dir) / "pressure_reference.json"
+    pressure_reference = (float(json.loads(reference_file.read_text())["pressure_reference_pa"])
+                          if reference_file.is_file() else 0.0)
+
+    cf_to_pa = skin_friction_scale_pa(run_dir)
 
     points_mm = None
     times_s = []
@@ -121,6 +171,12 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
         reader.Update()
         ug = reader.GetOutput()
         pd = ug.GetPointData()
+        if ug.GetPoints() is None or ug.GetNumberOfPoints() <= int(wall_vol_idx.max()):
+            raise ValueError(f"CFD frame {step} does not contain the expected mesh nodes")
+        all_pts = numpy_support.vtk_to_numpy(ug.GetPoints().GetData())
+        frame_points_mm = all_pts[wall_vol_idx] * 1000.
+        if not np.allclose(frame_points_mm, expected_points_mm, atol=1e-3, rtol=0):
+            raise ValueError(f"CFD frame {step} node order or geometry does not match the exported wall")
 
         if points_mm is None:
             # The flow_*.vtu snapshot's own point coordinates are in
@@ -136,12 +192,19 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
             # consumer of this field (the Swift viewer, any future one)
             # on the same mm convention every other surface in this app
             # already uses.
-            all_pts = numpy_support.vtk_to_numpy(ug.GetPoints().GetData())
-            points_mm = (all_pts[wall_vol_idx] * 1000.0).astype(np.float32)
+            points_mm = frame_points_mm.astype(np.float32)
 
-        cf = numpy_support.vtk_to_numpy(pd.GetArray("Skin_Friction_Coefficient"))
-        wss_vec = (0.5 * cf[wall_vol_idx]).astype(np.float32)
-        pressure = numpy_support.vtk_to_numpy(pd.GetArray("Pressure"))[wall_vol_idx].astype(np.float32)
+        cf_array, pressure_array = pd.GetArray("Skin_Friction_Coefficient"), pd.GetArray("Pressure")
+        if cf_array is None or pressure_array is None:
+            raise ValueError(f"CFD frame {step} is missing skin friction or pressure output")
+        cf = numpy_support.vtk_to_numpy(cf_array)
+        pressure_values = numpy_support.vtk_to_numpy(pressure_array)
+        if cf.shape != (ug.GetNumberOfPoints(), 3) or pressure_values.shape != (ug.GetNumberOfPoints(),):
+            raise ValueError(f"CFD frame {step} has invalid WSS or pressure dimensions")
+        wss_vec = (cf_to_pa * cf[wall_vol_idx]).astype(np.float32)
+        pressure = (pressure_values[wall_vol_idx] + pressure_reference).astype(np.float32)
+        if not np.isfinite(wss_vec).all() or not np.isfinite(pressure).all():
+            raise ValueError(f"CFD frame {step} contains nonfinite wall fields")
 
         wss_frames.append(wss_vec)
         pressure_frames.append(pressure)
@@ -158,33 +221,18 @@ def extract_wall_time_series(run_dir: Path, vtp_bytes: bytes, time_step_s: float
     }
 
 
-def _settled_cycle_mask(times_s: np.ndarray, cycle_s: float):
-    """Restricts time-averaging to the *last* full cardiac cycle present
-    in the data — the first cycle still carries startup transients (the
-    solver begins from a zero/uniform initial condition, not a converged
-    periodic state), so including it would bias TAWSS/OSI toward values
-    that don't reflect the actual periodic flow. Falls back to every
-    frame available if there's less than one full cycle's worth yet (a
-    partial/cancelled run) — better to show a provisional, clearly-partial
-    result than none at all."""
-    if times_s.size == 0:
-        return np.zeros(0, dtype=bool)
-    t_end = times_s[-1]
-    mask = times_s >= (t_end - cycle_s + 1e-9)
-    return mask if mask.any() else np.ones_like(times_s, dtype=bool)
-
-
 def compute_derived_fields(series: dict, cycle_s: float) -> dict:
-    """TAWSS/OSI/RRT/mean pressure over the settled last cycle, plus the
+    """TAWSS/OSI/RRT/mean pressure over the last recorded cycle, plus the
     raw per-frame WSS-magnitude/pressure time series (for an instantaneous
     frame-scrubbing view) — see module docstring for the formulas."""
-    times_s = series["times_s"]
-    wss_vec = series["wss_vec_pa"]  # (T, N, 3)
-    pressure = series["pressure_pa"]  # (T, N)
+    times_s = np.asarray(series["times_s"], dtype=float)
+    wss_vec = np.asarray(series["wss_vec_pa"], dtype=float)  # (T, N, 3)
+    pressure = np.asarray(series["pressure_pa"], dtype=float)  # (T, N)
+    validate_series(times_s, wss_vec, pressure, cycle_s)
 
-    mask = _settled_cycle_mask(times_s, cycle_s)
-    t_settled = times_s[mask]
-    w = wss_vec[mask]  # (T', N, 3)
+    t_settled, w = last_window(times_s, wss_vec, cycle_s)
+    _, window_pressure = last_window(times_s, pressure, cycle_s)
+    quality = cycle_quality(times_s, wss_vec, pressure, cycle_s)
 
     wss_mag = np.linalg.norm(wss_vec, axis=2)  # (T, N) — every frame, for scrubbing
 
@@ -199,14 +247,17 @@ def compute_derived_fields(series: dict, cycle_s: float) -> dict:
     tawss_safe = np.maximum(tawss, 1e-9)
     osi = 0.5 * (1.0 - mean_vec_mag / tawss_safe)
     osi = np.clip(osi, 0.0, 0.5)
+    undefined_osi = tawss <= 1e-9
+    osi[undefined_osi] = 0.  # finite display placeholder, explicitly masked below
+    quality["undefined_osi_nodes"] = int(undefined_osi.sum())
 
     denom = (1.0 - 2.0 * osi) * tawss_safe
     denom_safe = np.maximum(denom, 1.0 / RRT_CLAMP_PA_INV)  # avoid a real 1/0 before np.where selects it away
     rrt = np.where(denom > 1.0 / RRT_CLAMP_PA_INV, 1.0 / denom_safe, RRT_CLAMP_PA_INV)
 
     mean_pressure = (
-        np.trapezoid(pressure[mask], t_settled, axis=0) / (t_settled[-1] - t_settled[0])
-        if len(t_settled) >= 2 else pressure[mask].mean(axis=0)
+        np.trapezoid(window_pressure, t_settled, axis=0) / (t_settled[-1] - t_settled[0])
+        if len(t_settled) >= 2 else window_pressure.mean(axis=0)
     )
 
     return {
@@ -217,6 +268,9 @@ def compute_derived_fields(series: dict, cycle_s: float) -> dict:
         "wss_mag_frames_pa": wss_mag.astype(np.float32),  # (T, N)
         "pressure_frames_pa": pressure.astype(np.float32),  # (T, N)
         "times_s": times_s,
+        "temporal_quality": quality,
+        "osi_valid_mask": ~undefined_osi,
+        # Legacy field retained for old clients; quality reports periodicity.
         "settled_cycle_start_s": float(t_settled[0]) if len(t_settled) else 0.0,
     }
 
@@ -304,3 +358,107 @@ def compute_geometry_stats(vtp_bytes: bytes, face_map: dict) -> dict:
             })
     stats["angles"] = angles
     return stats
+
+
+def peak_systole_snapshot(run_dir: Path, cycle_s: float, time_step_s: float):
+    """Flow snapshot of the last recorded cycle with the largest inlet flow.
+
+    Falls back to the latest snapshot when no boundary-flow log exists.
+    Returns (path, time_s).
+    """
+    files = _flow_files_sorted(Path(run_dir))
+    if not files:
+        raise ValueError(f"no flow_*.vtu snapshots found in {run_dir}")
+    last_step = files[-1][1]
+    in_cycle = [(f, s) for f, s in files if (last_step - s) * time_step_s < cycle_s - 1e-9] or files[-1:]
+    flows = {}
+    log_path = Path(run_dir) / "boundary_flows.csv"
+    if log_path.is_file():
+        import csv
+        with open(log_path) as fh:
+            for row in csv.DictReader(fh):
+                # Log rows are 1-based solver steps; snapshot k is written after step k+1.
+                flows[int(row["step"]) - 1] = float(row["q_inlet_mlps"])
+    path, step = max(in_cycle, key=lambda fs: flows.get(fs[1], -np.inf)) if flows else in_cycle[-1]
+    return path, step * time_step_s
+
+
+def compute_streamlines(run_dir: Path, cycle_s: float, time_step_s: float, inlet_cap: dict,
+                        n_seeds: int = 350, seed=0):
+    """Velocity streamlines at peak systole, seeded across the inlet section.
+
+    inlet_cap: {"centroid_mm", "normal_mm" (outward), "equivalent_diameter_mm"}.
+    Returns {"time_s", "points_mm" (flat polyline points), "offsets" (start
+    index of each line, plus the total), "speed_cms" per point}.
+    """
+    path, time_s = peak_systole_snapshot(run_dir, cycle_s, time_step_s)
+    reader = vtk.vtkXMLUnstructuredGridReader()
+    reader.SetFileName(str(path))
+    reader.Update()
+    grid = reader.GetOutput()
+    grid.GetPointData().SetActiveVectors("Velocity")
+
+    centre = np.asarray(inlet_cap["centroid_mm"], float) / 1000.0
+    normal = np.asarray(inlet_cap["normal_mm"], float)
+    normal /= np.linalg.norm(normal)
+    radius = inlet_cap["equivalent_diameter_mm"] / 2000.0
+    u = np.cross(normal, [1.0, 0, 0] if abs(normal[0]) < 0.9 else [0, 1.0, 0])
+    u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    # Seed slightly inside the domain. Which side of the cap that is is
+    # tested on the mesh: the stored cap normal is not reliably outward.
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(grid)
+    locator.BuildLocator()
+    inward = None
+    for sign in (-1.0, 1.0):
+        if locator.FindCell(list(centre + sign * normal * radius * 0.3)) >= 0:
+            inward = sign * normal
+            break
+    if inward is None:
+        raise ValueError("could not place streamline seeds inside the inlet")
+    rng = np.random.default_rng(seed)
+    # Uniform over the disc.
+    r = radius * 0.92 * np.sqrt(rng.random(n_seeds))
+    a = 2 * np.pi * rng.random(n_seeds)
+    seeds_xyz = centre + inward * radius * 0.15 + np.outer(r * np.cos(a), u) + np.outer(r * np.sin(a), v)
+    seeds = vtk.vtkPolyData()
+    pts = vtk.vtkPoints()
+    pts.SetData(numpy_support.numpy_to_vtk(np.ascontiguousarray(seeds_xyz), deep=True))
+    seeds.SetPoints(pts)
+
+    tracer = vtk.vtkStreamTracer()
+    tracer.SetInputData(grid)
+    tracer.SetSourceData(seeds)
+    tracer.SetIntegratorTypeToRungeKutta45()
+    tracer.SetIntegrationDirectionToForward()
+    tracer.SetIntegrationStepUnit(vtk.vtkStreamTracer.CELL_LENGTH_UNIT)
+    tracer.SetInitialIntegrationStep(0.3)
+    tracer.SetMaximumPropagation(0.6)
+    tracer.SetMaximumNumberOfSteps(6000)
+    tracer.SetTerminalSpeed(1e-5)
+    tracer.Update()
+    out = tracer.GetOutput()
+
+    points = numpy_support.vtk_to_numpy(out.GetPoints().GetData()) if out.GetNumberOfPoints() else np.zeros((0, 3))
+    speed = np.linalg.norm(numpy_support.vtk_to_numpy(out.GetPointData().GetArray("Velocity")), axis=1) \
+        if out.GetNumberOfPoints() else np.zeros(0)
+    lines, offsets, kept_points, kept_speed = out.GetLines(), [0], [], []
+    lines.InitTraversal()
+    ids = vtk.vtkIdList()
+    while lines.GetNextCell(ids):
+        idx = np.array([ids.GetId(k) for k in range(ids.GetNumberOfIds())])
+        if len(idx) < 4:
+            continue
+        idx = idx[::2] if len(idx) > 400 else idx  # thin long lines for transfer
+        kept_points.append(points[idx] * 1000.0)
+        kept_speed.append(speed[idx] * 100.0)
+        offsets.append(offsets[-1] + len(idx))
+    if kept_points:
+        flat_points = np.vstack(kept_points)
+        flat_speed = np.concatenate(kept_speed)
+    else:
+        flat_points, flat_speed = np.zeros((0, 3)), np.zeros(0)
+    return {"time_s": float(time_s), "snapshot": Path(path).name,
+            "points_mm": np.round(flat_points, 3).ravel().tolist(),
+            "offsets": offsets, "speed_cms": np.round(flat_speed, 2).tolist()}

@@ -176,6 +176,57 @@ def _xyz(point_mm):
     return [point_mm[2], point_mm[1], point_mm[0]]
 
 
+def _boundary_pinch_vertices(offsets, connectivity, kept_cells):
+    """Vertices with more than two boundary edges among the kept cells."""
+    sizes = np.diff(offsets)
+    cell_of = np.repeat(np.arange(len(sizes)), sizes)
+    position = np.arange(len(connectivity))
+    starts = offsets[:-1][cell_of]
+    nxt = np.where(position + 1 < starts + sizes[cell_of], position + 1, starts)
+    keep = kept_cells[cell_of]
+    a, b = connectivity[keep], connectivity[nxt][keep]
+    edges = np.sort(np.column_stack((a, b)), axis=1)
+    unique, counts = np.unique(edges, axis=0, return_counts=True)
+    boundary = unique[counts == 1]
+    if not len(boundary):
+        return np.zeros(0, dtype=np.int64)
+    vertices, degree = np.unique(boundary.ravel(), return_counts=True)
+    return vertices[degree > 2]
+
+
+def _end_patch_only(remove_point, offsets, connectivity, dist):
+    """Keep only the connected patch of to-be-removed points at the cut.
+
+    The bounding sphere can also reach a different part of the vessel that
+    passes close to this end (on a real case a short ECA ended next to the
+    ICA loop). Removing those points opened a hole in the other wall; the
+    hole was then fan-closed across a non-planar loop and intersected the
+    wall, so TetGen rejected the surface. Only the component containing the
+    candidate nearest the cut point belongs to this end.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    candidates = np.flatnonzero(remove_point)
+    if len(candidates) < 2:
+        return remove_point
+    sizes = np.diff(offsets)
+    cell_of = np.repeat(np.arange(len(sizes)), sizes)
+    starts = offsets[:-1][cell_of]
+    nxt = np.where(np.arange(len(connectivity)) + 1 < starts + sizes[cell_of],
+                   np.arange(len(connectivity)) + 1, starts)
+    a, b = connectivity, connectivity[nxt]
+    both = remove_point[a] & remove_point[b]
+    index = -np.ones(len(remove_point), dtype=np.int64)
+    index[candidates] = np.arange(len(candidates))
+    graph = coo_matrix((np.ones(both.sum()), (index[a[both]], index[b[both]])),
+                       shape=(len(candidates), len(candidates)))
+    _, labels = connected_components(graph, directed=False)
+    nearest = int(np.argmin(dist[candidates]))
+    keep = np.zeros_like(remove_point)
+    keep[candidates[labels == labels[nearest]]] = True
+    return keep
+
+
 def _local_open_end(poly, cut_point_mm, cut_tangent_mm, bound_radius_mm, at_start: bool):
     """Opens a face in `poly` by deleting triangles that are both past
     the cut plane (through cut_point_mm, normal cut_tangent_mm) *and*
@@ -212,16 +263,41 @@ def _local_open_end(poly, cut_point_mm, cut_tangent_mm, bound_radius_mm, at_star
         return poly
 
     polys = poly.GetPolys()
-    polys.InitTraversal()
-    id_list = vtk.vtkIdList()
+    offsets = numpy_support.vtk_to_numpy(polys.GetOffsetsArray()).astype(np.int64)
+    connectivity = numpy_support.vtk_to_numpy(polys.GetConnectivityArray()).astype(np.int64)
+    remove_point = _end_patch_only(remove_point, offsets, connectivity, dist)
+    # A cell is dropped when any of its points is removed (same rule as the
+    # per-cell loop this replaces, done with one reduceat over the flat ids).
+    sizes = np.diff(offsets)
+    nonempty = sizes > 0
+
+    def dropped(mask):
+        out = np.zeros(len(sizes), dtype=bool)
+        if nonempty.any():
+            out[nonempty] = np.logical_or.reduceat(mask[connectivity], offsets[:-1][nonempty])
+        return out
+
+    drop = dropped(remove_point)
+    # A cut whose removed patch touches itself at one vertex leaves a
+    # figure-of-eight opening; its two caps overlap and TetGen rejects the
+    # surface. Removing the triangles around such pinch vertices merges the
+    # lobes into one simple ring. Only vertices near this cut are considered.
+    for _ in range(5):
+        pinch = _boundary_pinch_vertices(offsets, connectivity, ~drop)
+        pinch = pinch[dist[pinch] < 1.5 * bound_radius_mm] if len(pinch) else pinch
+        if not len(pinch):
+            break
+        remove_point = remove_point.copy()
+        remove_point[pinch] = True
+        drop = dropped(remove_point)
+    keep_ids = np.repeat(~drop, sizes)
+    keep_sizes = sizes[~drop]
+    new_offsets = np.concatenate([[0], np.cumsum(keep_sizes)]).astype(np.int64)
     new_polys = vtk.vtkCellArray()
-    while polys.GetNextCell(id_list):
-        ids = [id_list.GetId(k) for k in range(id_list.GetNumberOfIds())]
-        if any(remove_point[i] for i in ids):
-            continue
-        new_polys.InsertNextCell(len(ids))
-        for i in ids:
-            new_polys.InsertCellPoint(i)
+    new_polys.SetData(
+        numpy_support.numpy_to_vtk(new_offsets, deep=True, array_type=vtk.VTK_ID_TYPE),
+        numpy_support.numpy_to_vtk(connectivity[keep_ids], deep=True, array_type=vtk.VTK_ID_TYPE),
+    )
 
     result = vtk.vtkPolyData()
     result.SetPoints(poly.GetPoints())
@@ -444,10 +520,19 @@ def _stamp_contour(mask, crop_origin_mm, spacing_mm, center_mm, tangent_mm, cont
     delta = world - center
     along = delta @ t
     within_thickness = np.abs(along) <= half_thickness_mm
-    pu = delta @ u
-    pv = delta @ v
-    inside_poly = _points_in_polygon_2d(pu, pv, poly_u, poly_v)
-    mask[lo_vox[0]:hi_vox[0], lo_vox[1]:hi_vox[1], lo_vox[2]:hi_vox[2]] |= (within_thickness & inside_poly)
+    # The thin slab is a small fraction of the bounding box; test only its
+    # voxels (and only those inside the polygon's own u/v extent) instead of
+    # running the per-edge ray cast over the whole box.
+    candidates = np.flatnonzero(within_thickness)
+    flat_delta = delta.reshape(-1, 3)[candidates]
+    pu = flat_delta @ u
+    pv = flat_delta @ v
+    in_box = ((pu >= poly_u.min()) & (pu <= poly_u.max())
+              & (pv >= poly_v.min()) & (pv <= poly_v.max()))
+    candidates, pu, pv = candidates[in_box], pu[in_box], pv[in_box]
+    stamp = np.zeros(within_thickness.size, dtype=bool)
+    stamp[candidates] = _points_in_polygon_2d(pu, pv, poly_u, poly_v)
+    mask[lo_vox[0]:hi_vox[0], lo_vox[1]:hi_vox[1], lo_vox[2]:hi_vox[2]] |= stamp.reshape(within_thickness.shape)
     return True
 
 
@@ -593,6 +678,9 @@ def _radius_outliers(radii, window=2, ratio=1.8):
     return flagged
 
 
+MAX_BRIDGED_MISSING = 2
+
+
 def _bridge_gap(point_a, contour_a, point_b, contour_b, step_mm=BRIDGE_STEP_MM,
                  max_angle_deg_per_step=BRIDGE_MAX_ANGLE_DEG_PER_STEP):
     """Interpolated sub-points to stamp strictly between two consecutive
@@ -712,12 +800,24 @@ def _rasterize_branch(mask, crop_origin_mm, spacing_mm, series):
     resolved_indices = [i for i in range(len(series)) if resolved_contours[i] is not None]
     for idx in range(len(resolved_indices) - 1):
         i, j = resolved_indices[idx], resolved_indices[idx + 1]
-        if j != i + 1:
+        # Also bridge a short run of unsegmented sections (up to
+        # MAX_BRIDGED_MISSING): one cleared section otherwise severs the mask
+        # and _largest_component drops the rest of the branch.
+        if j - i - 1 > MAX_BRIDGED_MISSING:
             continue
         for sub in _bridge_gap(series[i], resolved_contours[i], series[j], resolved_contours[j]):
             _stamp_contour(mask, crop_origin_mm, spacing_mm, sub["point_mm"], sub["tangent_mm"], sub["contour_mm"])
 
     return stamped, substituted
+
+
+def _strip_unsegmented_ends(series):
+    has = [bool(p.get("contour_mm")) and len(p["contour_mm"]) >= 3 for p in series]
+    if not any(has):
+        return []
+    first = has.index(True)
+    last = len(has) - 1 - has[::-1].index(True)
+    return series[first:last + 1]
 
 
 def build_surface(array_shape, spacing_mm, origin_mm, series_by_branch: dict):
@@ -772,7 +872,11 @@ def build_surface(array_shape, spacing_mm, origin_mm, series_by_branch: dict):
     # applies only to its own end.
     trimmed_by_branch = {}
     for branch in ("cca_ica", "cca_eca"):
-        series = series_by_branch.get(branch) or []
+        # Unsegmented sections at either end are not part of the vessel: the
+        # inlet/outlet must be opened at the last section that has a contour,
+        # otherwise the cut lands where there is no surface and the outlet is
+        # never opened (real case: the operator cleared the last ECA sections).
+        series = _strip_unsegmented_ends(series_by_branch.get(branch) or [])
         if len(series) >= 2:
             series = _inset_series(series, CUT_INSET_MM, at_start=True)
         if len(series) >= 2:

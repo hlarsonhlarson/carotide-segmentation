@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from vtk import vtkPolyData
 
 from server import app as backend, cases, projects, workflow, su2_run
 from server.coordinates import voxel_to_world, world_to_voxel, surface_xyz
@@ -75,7 +76,7 @@ def test_round_trip_and_reopen_reuses_case(client, case, tmp_path, monkeypatch):
     assert client.post(f'/cases/{case.case_id}/save/project').status_code == 200
     before = projects.snapshot(case)
     cases._CASES.clear()
-    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *args: (case.array, case.spacing_mm, case.origin_mm, 'CT'))
+    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *args, **kwargs: (case.array, case.spacing_mm, case.origin_mm, 'CT', {}))
     result = client.post('/projects/open', json={'path': str(tmp_path)})
     assert result.status_code == 200, result.text
     restored = cases.get(result.json()['case_id'])
@@ -124,7 +125,7 @@ def test_old_mesh_completion_cannot_resurrect_results(client, case, monkeypatch)
         threads.append(thread)
         return thread
     monkeypatch.setattr(backend.threading, 'Thread', track)
-    monkeypatch.setattr(backend.build_surface, 'build_surface', lambda *a: (object(), {}))
+    monkeypatch.setattr(backend.build_surface, 'build_surface', lambda *a: (vtkPolyData(), {}))
     def slow_mesh(*args, **kwargs):
         started.set()
         assert finish.wait(3)
@@ -174,7 +175,7 @@ def test_migration_preserves_original_and_requires_review(client, case, tmp_path
     (source / 'project.json').write_text(json.dumps({'source_path': case.source_path, 'series_uid': case.series_uid}))
     (source / 'right_centerline.json').write_text(json.dumps({'cca_ica': {'control_points': [[1, 2, 3]], 'centerline_points': [[1, 2, 3], [6, 2, 3]]}}))
     original = (source / 'project.json').read_bytes()
-    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *a: (case.array, case.spacing_mm, case.origin_mm, 'CT'))
+    monkeypatch.setattr(backend.dicom_io, 'load_series', lambda *a, **kwargs: (case.array, case.spacing_mm, case.origin_mm, 'CT', {}))
     destination = tmp_path / 'new'
     migrate(source, destination)
     assert (source / 'project.json').read_bytes() == original
@@ -220,3 +221,56 @@ def test_invalid_saved_coordinates_are_rejected(case, tmp_path):
     data['sides']['right']['branches']['cca_ica']['control_points'] = [[100, 0, 0]]
     with pytest.raises(ValueError, match='outside'):
         projects.restore(case, data, tmp_path)
+
+
+
+def test_autosave_still_detects_foreign_manifest_after_own_writes(case, tmp_path):
+    import json
+    from fastapi import HTTPException
+    from server import projects
+    case.project_dir = str(tmp_path)
+    projects.atomic_write(tmp_path / 'project.json', projects._manifest_json(projects.snapshot(case)))
+    projects.autosave(case)
+    projects.autosave(case)  # unchanged since our own write: no re-parse needed
+    foreign = json.loads((tmp_path / 'project.json').read_text())
+    foreign['project_id'] = 'someone-else'
+    (tmp_path / 'project.json').write_text(json.dumps(foreign))
+    with pytest.raises(HTTPException) as error:
+        projects.autosave(case)
+    assert error.value.status_code == 409
+
+
+def test_restitch_reuses_hops_and_matches_fresh_paths():
+    from server import centerline_path
+    rng = np.random.default_rng(1)
+    volume = rng.uniform(0, 80, (40, 40, 40)).astype(np.float32)
+    volume[5:35, 18:22, 18:22] = 400
+    spacing = np.array([1., 1., 1.])
+    points = [[6, 20, 20], [20, 20, 20], [33, 20, 20]]
+    first = centerline_path.stitch_full_path(volume, spacing, 'CT', points)
+    again = centerline_path.stitch_full_path(volume, spacing, 'CT', points)
+    fresh = [points[0]]
+    for a, b in zip(points, points[1:]):
+        fresh.extend(centerline_path.stitch(volume, spacing, 'CT', a, b)[1:])
+    assert first == again == fresh
+
+
+def test_finished_results_are_saved_automatically_and_replaced(case, tmp_path):
+    import json
+    from server import app as backend, projects
+    case.project_dir = str(tmp_path)
+    projects.atomic_write(tmp_path / 'project.json', projects._manifest_json(projects.snapshot(case)))
+    case.su2_postprocess_jobs['right'] = dict(state='done', result={'value': 1}, frames={
+        'wss_mag_pa': np.ones((2, 3)), 'pressure_pa': np.ones((2, 3))})
+    backend._autosave_artifact(case, 'right', 'cfd')
+    first = dict(case.saved_artifacts['right:cfd'])
+    assert (tmp_path / first['result']).is_file() and (tmp_path / first['frames']).is_file()
+    saved = json.loads((tmp_path / 'project.json').read_text())
+    assert saved['artifacts']['right:cfd']['result'] == first['result']
+    backend._autosave_artifact(case, 'right', 'cfd')
+    second = case.saved_artifacts['right:cfd']
+    assert (tmp_path / second['result']).is_file()
+    assert not (tmp_path / first['result']).exists() and not (tmp_path / first['frames']).exists()
+    # Without a project folder nothing is written and nothing fails.
+    case.project_dir = None
+    backend._autosave_artifact(case, 'right', 'cfd')

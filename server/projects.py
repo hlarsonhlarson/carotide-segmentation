@@ -30,34 +30,74 @@ def atomic_write(path, data):
 
 
 def snapshot(case):
+    from .coordinates import voxel_to_lps
+    affine = np.eye(4)
+    affine[:3, :3] = case.direction_lps @ np.diag(case.spacing_mm[::-1])
+    affine[:3, 3] = case.origin_mm[::-1]
     return {
         'format_version': FORMAT_VERSION, 'project_id': case.project_id,
-        'source_path': case.source_path, 'series_uid': case.series_uid,
+        'source_path': storage.portable_path(case.source_path, 'dicom'), 'series_uid': case.series_uid,
         'geometry': {'shape': list(case.array.shape), 'spacing_mm': case.spacing_mm.tolist(),
-                     'origin_mm': case.origin_mm.tolist(), 'coordinate_system': 'zyx-mm'},
+                     'origin_mm': case.origin_mm.tolist(), 'coordinate_system': 'zyx-mm',
+                     'direction_lps': case.direction_lps.tolist(),
+                     'affine_xyz_to_lps': affine.tolist()},
+        'algorithm': {'version': 'geometry-fwhm-1', 'lumen_method': 'radial_half_height',
+                      'model_total_mode': 'fast', 'clinical_validation': False},
         'revisions': case.revisions,
         'stale': {s: sorted(v) for s, v in case.stale.items()},
         'sides': {side: {
             'branches': {branch: {
                 'control_points': case.control_points.get((side, branch), []),
                 'centerline_points': case.centerline_points.get((side, branch), []),
+                'centerline_lps_mm': voxel_to_lps(
+                    case.centerline_points[(side, branch)], case.spacing_mm,
+                    case.origin_mm, case.direction_lps).tolist()
+                    if case.centerline_points.get((side, branch)) else [],
                 'segmentation': case.segmentation_series.get((side, branch), []),
             } for branch in workflow.BRANCHES},
             'params': case.su2_params.get(side),
         } for side in workflow.SIDES},
         'artifacts': case.saved_artifacts, 'warnings': case.project_warnings,
+        'autoseed_review': case.autoseed_review,
     }
+
+
+def _manifest_json(data) -> bytes:
+    # indent= forces json's pure-Python encoder; compact output uses the C
+    # encoder and is several times faster on multi-MB manifests. Autosave
+    # runs after every edit, so this is on the interactive path.
+    return json.dumps(data, allow_nan=False, separators=(',', ':')).encode()
+
+
+def _stamp(path):
+    st = os.stat(path)
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+# {case_id: (manifest path, stat stamp)} of the manifest this process last
+# wrote. Parsing a 1 MB manifest only to read its project_id cost ~20 ms per
+# edit; an unchanged file (same inode, mtime and size) is still ours.
+_LAST_WRITTEN: dict = {}
 
 
 def autosave(case):
     if case.project_dir:
         folder = Path(case.project_dir)
-        current = json.loads((folder / 'project.json').read_text())
-        if current.get('project_id') != case.project_id:
-            raise HTTPException(409, 'project ownership changed; reopen the project')
+        manifest = folder / 'project.json'
+        known = _LAST_WRITTEN.get(case.case_id)
         try:
-            atomic_write(folder / 'project.json', json.dumps(snapshot(case), allow_nan=False, indent=2).encode())
+            unchanged = known is not None and known[0] == str(manifest) and known[1] == _stamp(manifest)
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            current = json.loads(manifest.read_text())
+            if current.get('project_id') != case.project_id:
+                raise HTTPException(409, 'project ownership changed; reopen the project')
+        try:
+            atomic_write(manifest, _manifest_json(snapshot(case)))
+            _LAST_WRITTEN[case.case_id] = (str(manifest), _stamp(manifest))
         except OSError as e:
+            _LAST_WRITTEN.pop(case.case_id, None)
             raise HTTPException(507, f'Autosave failed; edits remain in memory. Save again before closing: {e}') from e
 
 
@@ -95,8 +135,18 @@ def save_artifact(case, side, stage):
         np.savez_compressed(buf, **job['frames'])
         record['frames'] = write('.npz', buf.getvalue())
         record['provenance'] = job.get('provenance', {})
+    previous = case.saved_artifacts.get(f'{side}:{stage}')
     case.saved_artifacts[f'{side}:{stage}'] = record
     autosave(case)
+    # Re-saving a stage replaces its files; remove the superseded ones so
+    # automatic saving does not accumulate copies of multi-MB results.
+    for key in ('stl', 'vtu', 'vtp', 'result', 'frames'):
+        old = (previous or {}).get(key)
+        if old and old != record.get(key):
+            try:
+                artifact_path(folder, old).unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
 
 
 class ProjectRequest(BaseModel):
@@ -121,7 +171,7 @@ def set_project_dir(case_id: str, req: ProjectRequest):
         raise HTTPException(409, 'Project already has a folder; copy the closed project folder to move it.')
     case.project_dir = str(folder)
     try:
-        atomic_write(manifest, json.dumps(snapshot(case), allow_nan=False, indent=2).encode())
+        atomic_write(manifest, _manifest_json(snapshot(case)))
     except Exception:
         case.project_dir = old
         raise
@@ -193,9 +243,12 @@ def restore(case, manifest, folder):
     if (geometry['shape'] != list(case.array.shape)
             or not np.allclose(geometry['spacing_mm'], case.spacing_mm)
             or not np.allclose(geometry['origin_mm'], case.origin_mm)
+            or ('direction_lps' in geometry and
+                not np.allclose(geometry['direction_lps'], case.direction_lps))
             or geometry.get('coordinate_system') != 'zyx-mm'):
         raise HTTPException(409, 'Source image geometry has changed; original project was not modified.')
     case.project_warnings = list(manifest.get('warnings', []))
+    case.autoseed_review = dict(manifest.get('autoseed_review', {}))
     case.project_id = manifest['project_id']
     case.revisions = manifest['revisions']
     case.stale = {s: set(manifest.get('stale', {}).get(s, [])) for s in workflow.SIDES}

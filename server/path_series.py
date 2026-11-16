@@ -5,7 +5,6 @@ ports simvascular_build_mesh.py's resample_by_arclength (already written
 and reasoned about for this same purpose), operating on world-mm points
 instead of the SimVascular-specific path object.
 """
-import math
 from .coordinates import voxel_to_world
 
 import numpy as np
@@ -36,18 +35,37 @@ def smooth_path(points_mm, sigma_points: float = SMOOTHING_SIGMA_POINTS):
 
 
 def resample_by_arclength(points_mm, spacing_mm: float = CONTROL_POINT_SPACING_MM):
+    if not np.isfinite(spacing_mm) or spacing_mm <= 0:
+        raise ValueError("Path sampling spacing must be positive")
     if len(points_mm) < 2:
         return list(points_mm)
-    kept = [points_mm[0]]
-    acc = 0.0
-    for a, b in zip(points_mm, points_mm[1:]):
-        acc += math.dist(a, b)
-        if acc >= spacing_mm:
-            kept.append(b)
-            acc = 0.0
-    if kept[-1] != points_mm[-1]:
-        kept.append(points_mm[-1])
-    return kept
+    pts = np.asarray(points_mm, dtype=float)
+    distance = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    pts = pts[np.r_[True, distance > 1e-9]]
+    if len(pts) < 2:
+        return pts.tolist()
+    arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
+    samples = np.r_[np.arange(0, arc[-1], spacing_mm), arc[-1]]
+    return np.column_stack([np.interp(samples, arc, pts[:, axis]) for axis in range(3)]).tolist()
+
+
+def parallel_transport_frames(tangents):
+    """Rotation-minimizing frames, with no arbitrary up-axis switches."""
+    normals, binormals = [], []
+    for tangent in np.asarray(tangents, dtype=float):
+        t = tangent / max(np.linalg.norm(tangent), 1e-12)
+        if normals:
+            n = normals[-1] - np.dot(normals[-1], t) * t
+        else:
+            seed = np.eye(3)[np.argmin(np.abs(t))]
+            n = seed - np.dot(seed, t) * t
+        if np.linalg.norm(n) < 1e-8:
+            seed = np.eye(3)[np.argmin(np.abs(t))]
+            n = seed - np.dot(seed, t) * t
+        n /= np.linalg.norm(n)
+        normals.append(n)
+        binormals.append(np.cross(t, n))
+    return np.asarray(normals), np.asarray(binormals)
 
 
 def tangents_for(points_mm):
@@ -76,4 +94,6 @@ def build_series(path_voxel, spacing_mm, origin_mm,
     world_pts = smooth_path(world_pts)
     control_pts = resample_by_arclength(world_pts, control_spacing_mm)
     tangents = tangents_for(control_pts)
-    return [{"point_mm": p, "tangent_mm": t} for p, t in zip(control_pts, tangents)]
+    normals, binormals = parallel_transport_frames(tangents)
+    return [{"point_mm": p, "tangent_mm": t, "u_vec": u.tolist(), "v_vec": v.tolist()}
+            for p, t, u, v in zip(control_pts, tangents, normals, binormals)]

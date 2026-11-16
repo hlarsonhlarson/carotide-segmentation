@@ -18,6 +18,13 @@ final class Interactive3DSceneView: SCNView {
 
     override var isFlipped: Bool { true }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // A cached scene can be populated before its sheet is attached.
+        // Draw it on attachment without enabling continuous rendering.
+        if window != nil { needsDisplay = true }
+    }
+
     override func layout() {
         super.layout()
         guard let window else { return }

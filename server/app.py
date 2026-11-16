@@ -14,12 +14,17 @@ from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 from typing import Literal
 from . import workflow, projects, storage
+from .lumen_profiles import fwhm_contour
+from .wall_analysis import analyze_wall, measure_wall_section
+from .longitudinal_analysis import analyze_series
+from .cfd_balance import summarize_balance
+from .lumen_measurements import contour_metrics, nascet_estimate
 
 from pathlib import Path
 
 from . import (
     build_surface, cases, centerline_path, dicom_io, path_series, reslice, segment2d,
-    su2_export, su2_postprocess, su2_run,
+    su2_export, su2_postprocess, su2_run, surface_cache, autoseed as autoseed_job,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -60,12 +65,51 @@ class ReorderRequest(BaseModel):
 
 
 class SegmentPointRequest(BaseModel):
-    method: Literal["auto", "threshold", "levelset", "circle"]  # "threshold" | "levelset" | "circle"
+    method: Literal["auto", "threshold", "levelset", "circle", "fwhm"]
     radius_mm: float = Field(gt=0, le=50, allow_inf_nan=False)
 
 
 class ManualContourRequest(BaseModel):
     contour_px: list[list[float]]  # [[row, col], ...], same pixel space as the oblique slice
+
+
+class LumenMeasurementRequest(BaseModel):
+    index: int = Field(ge=0)
+    reference_index: int | None = Field(default=None, ge=0)
+    confirmed_ica_reference: bool = False
+
+
+class WallAnalysisRequest(BaseModel):
+    calcium_hu: float = Field(gt=130, le=3000)
+    min_component_mm2: float = Field(default=.5, gt=0, le=20)
+    min_thickness_mm: float = Field(default=.3, gt=0, lt=6)
+    max_thickness_mm: float = Field(default=6, gt=0, le=6)
+    wall_contour_px: list[list[float]] | None = None
+    # Plaque composition (server/plaque_composition.py); experimental HU bands.
+    lipid_hu: float = Field(default=50, ge=-100, le=130)
+    fat_hu: float = Field(default=-50, ge=-300, lt=130)
+    fibrous_max_hu: float = Field(default=150, gt=0, le=300)
+    edge_margin_mm: float = Field(default=.5, ge=0, le=2)
+    # Outer-wall search ignores edges whose inner side is brighter than this:
+    # those belong to the blurred contrast lumen, not to the outer wall.
+    soft_tissue_max_hu: float | None = Field(default=100, gt=0, le=300)
+
+    @model_validator(mode="after")
+    def _ordered_thresholds(self):
+        if not self.fat_hu < self.lipid_hu < self.fibrous_max_hu < self.calcium_hu:
+            raise ValueError("thresholds must satisfy fat_hu < lipid_hu < fibrous_max_hu < calcium_hu")
+        return self
+
+
+class PlaqueZoneRequest(WallAnalysisRequest):
+    start_index: int = Field(ge=0)
+    end_index: int = Field(ge=0)
+
+
+class LongitudinalAnalysisRequest(BaseModel):
+    start_index: int = Field(default=0, ge=0)
+    end_index: int | None = Field(default=None, ge=0)
+    max_step_mm: float = Field(default=4., gt=0, le=10)
 
 
 class SU2ParamsRequest(BaseModel):
@@ -122,20 +166,6 @@ def _window_png(array2d: np.ndarray, wl: float, ww: float) -> bytes:
     return buf.getvalue()
 
 
-def _default_window(array: np.ndarray, modality: str):
-    """(center, width) in intensity units. CT: fixed, vessel-friendly (wide
-    enough to show contrast-enhanced lumen without blowing out bone). MR has
-    no fixed intensity scale, so stretch from this volume's own 1st/99th
-    percentile instead — same percentile-based approach already used for
-    TOF display elsewhere in this project (mra_pipeline's MIP diagnostics)."""
-    if modality == "CT":
-        return 300.0, 800.0
-    lo, hi = np.percentile(array, [1.0, 99.0])
-    if hi <= lo:
-        hi = lo + 1.0
-    return float((lo + hi) / 2.0), float(hi - lo)
-
-
 @app.get("/series")
 def get_series(path: str):
     path = str(storage.allowed_path(path, "dicom"))
@@ -161,7 +191,11 @@ def _load_dicom_case(path: str, series_uid: str | None):
             if len(available) != 1:
                 raise HTTPException(400, "Choose a DICOM series explicitly")
             series_uid = available[0]["series_uid"]
-        array, spacing_mm, origin_mm, modality = dicom_io.load_series(path, series_uid)
+        loaded = dicom_io.load_series(
+            path, series_uid, include_display_flips=True, include_geometry=True
+        )
+        array, spacing_mm, origin_mm, modality, flips = loaded[:5]
+        direction_lps = loaded[5] if len(loaded) > 5 else np.eye(3)
     except HTTPException:
         raise
     except FileNotFoundError as e:
@@ -173,7 +207,9 @@ def _load_dicom_case(path: str, series_uid: str | None):
         raise HTTPException(status_code=400, detail=f"could not load DICOM series: {e}")
 
     case = cases.create(array, spacing_mm, origin_mm, modality, str(Path(path).expanduser().resolve()), series_uid=series_uid)
-    wl, ww = _default_window(array, modality)
+    case.display_flips = flips
+    case.direction_lps = direction_lps
+    wl, ww = case.default_window
     info = {
         "case_id": case.case_id,
         "shape": list(array.shape),
@@ -181,6 +217,8 @@ def _load_dicom_case(path: str, series_uid: str | None):
         "origin_mm": origin_mm.tolist(),
         "modality": modality,
         "default_window": {"wl": wl, "ww": ww},
+        "display_flips": case.display_flips,
+        "direction_lps": case.direction_lps.tolist(),
     }
     return case, info
 
@@ -197,7 +235,7 @@ def get_meta(case_id: str):
     case = cases.get(case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="unknown case_id")
-    wl, ww = _default_window(case.array, case.modality)
+    wl, ww = case.default_window
     return {
         "case_id": case.case_id,
         "shape": list(case.array.shape),
@@ -206,6 +244,8 @@ def get_meta(case_id: str):
         "modality": case.modality,
         "source_path": case.source_path,
         "default_window": {"wl": wl, "ww": ww},
+        "display_flips": case.display_flips,
+        "direction_lps": case.direction_lps.tolist(),
     }
 
 
@@ -226,6 +266,9 @@ def get_slice(case_id: str, axis: str, index: int, wl: float | None = None, ww: 
     if axis_i == 0:
         plane = case.array[index, :, :]
     elif axis_i == 1:
+        # The PNG convention reverses voxel Z. For descending acquisitions,
+        # display_flips metadata tells the viewer to correct the display
+        # without changing stored voxel coordinates.
         # Coronal/sagittal planes have z (axis 0, increasing toward
         # superior — established convention throughout this codebase, see
         # mra_pipeline.py) as their row axis. Row 0 is the TOP of the
@@ -238,14 +281,77 @@ def get_slice(case_id: str, axis: str, index: int, wl: float | None = None, ww: 
         plane = case.array[::-1, :, index]
 
     if wl is None or ww is None:
-        wl, ww = _default_window(case.array, case.modality)
+        wl, ww = case.default_window
     return Response(content=_window_png(plane, wl, ww), media_type="image/png")
 
 
 @app.post("/cases/{case_id}/autoseed")
-@workflow.edit
 def autoseed(case_id: str):
-    raise HTTPException(status_code=501, detail="not implemented yet")
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    if case.modality != "CT":
+        raise HTTPException(status_code=422, detail="automatic seeding currently requires contrast-enhanced CT")
+    with case.lock:
+        job = autoseed_job.start(case)
+    return _public_autoseed_job(job)
+
+
+def _public_autoseed_job(job):
+    if not job:
+        return {"state": "idle"}
+    # Tracebacks are useful in server logs but must not be exposed by the API.
+    return {key: value for key, value in job.items() if key not in {"traceback", "revision"}}
+
+
+@app.get("/cases/{case_id}/autoseed")
+@workflow.locked
+def autoseed_status(case_id: str):
+    return _public_autoseed_job(cases.get(case_id).autoseed_job)
+
+
+@app.post("/cases/{case_id}/autoseed/accept")
+@workflow.edit
+def accept_autoseed_review(case_id: str):
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    job = case.autoseed_job
+    if not job or job.get("state") != "done":
+        raise HTTPException(status_code=409, detail="there is no completed automatic draft to review")
+    missing = []
+    for key in job.get("paths", {}):
+        side, branch = key.split(":", 1)
+        series = case.segmentation_series.get((side, branch), [])
+        missing.extend(f"{side}:{branch}:{index + 1}" for index, point in enumerate(series)
+                       if not point.get("contour_mm"))
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Automatic draft still has unsegmented sections. Repair every listed section before confirming review.",
+                "missing_sections": missing,
+            },
+        )
+    case.autoseed_review = {"job_id": job["id"], "accepted": True}
+    job["review_accepted"] = True
+    return _public_autoseed_job(job)
+
+
+def _require_autoseed_review(case):
+    """Block downstream geometry only for a completed automatic draft.
+
+    Purely manual cases retain the pre-existing workflow; this is a safety
+    gate against treating an unattended ML/rule-based result as validated.
+    """
+    job = case.autoseed_job
+    if job and job.get("state") == "done":
+        review = case.autoseed_review
+        if review.get("job_id") != job.get("id") or not review.get("accepted"):
+            raise HTTPException(
+                status_code=409,
+                detail="Review the automatic contours and confirm the draft before building a surface, mesh, or CFD result.",
+            )
 
 
 def _check_side_branch(side: str, branch: str):
@@ -525,9 +631,11 @@ def get_segment_slice(case_id: str, side: str, branch: str, index: int,
     slice_2d, u_vec, v_vec, grid_origin = reslice.sample_oblique_slice(
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
     )
     if wl is None or ww is None:
-        wl, ww = _default_window(case.array, case.modality)
+        wl, ww = case.default_window
     png = _window_png(slice_2d, wl, ww)
     headers = {
         "X-Grid-Origin-Mm": ",".join(str(v) for v in grid_origin),
@@ -538,23 +646,158 @@ def get_segment_slice(case_id: str, side: str, branch: str, index: int,
     return Response(content=png, media_type="image/png", headers=headers)
 
 
+@app.post("/cases/{case_id}/segment/{side}/{branch}/point/{index}/wall")
+@workflow.edit
+def propose_wall(case_id: str, side: str, branch: str, index: int, req: WallAnalysisRequest):
+    case, series = _get_series_point(case_id, side, branch, index)
+    return _analyze_point_wall(case, series[index], req)
+
+
+def _analyze_point_wall(case, point, req: WallAnalysisRequest):
+    """Outer wall and plaque composition of one section; raises 422 if not found."""
+    if case.modality != "CT" or point.get("method") == "circle" or not point.get("contour_px"):
+        raise HTTPException(422, "A measured CTA lumen contour is required")
+    image, u, v, origin = reslice.sample_oblique_slice(
+        case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
+        size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
+    )
+    try:
+        composition_keys = {"lipid_hu", "fat_hu", "fibrous_max_hu", "edge_margin_mm"}
+        composition = req.model_dump(include=composition_keys)
+        parameters = req.model_dump(exclude={"wall_contour_px", "soft_tissue_max_hu"} | composition_keys)
+        if req.wall_contour_px is None:
+            result = analyze_wall(image, point["contour_px"], RESLICE_PX_SPACING_MM, **parameters,
+                                  composition=composition, soft_tissue_max_hu=req.soft_tissue_max_hu)
+            result["parameters"]["soft_tissue_max_hu"] = req.soft_tissue_max_hu
+        else:
+            result = measure_wall_section(image, point["contour_px"], req.wall_contour_px,
+                                          RESLICE_PX_SPACING_MM, req.calcium_hu, req.min_component_mm2,
+                                          composition)
+            result.update(status="manual", validated=False, parameters=parameters,
+                          algorithm_version="manual-wall-section-1",
+                          max_radial_thickness_mm=None, edge_support_fraction=None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    result["wall_contour_mm"] = [
+        (origin + c * RESLICE_PX_SPACING_MM * u + r * RESLICE_PX_SPACING_MM * v).tolist()
+        for r, c in result["wall_contour_px"]
+    ]
+    # Pixel [row, col] -> mm: origin + col*px*u + row*px*v. Lets clients place
+    # composition pixels in 3D without resampling the section again.
+    result["section_frame"] = {"origin_mm": np.asarray(origin).tolist(), "u": np.asarray(u).tolist(),
+                               "v": np.asarray(v).tolist(), "px_mm": RESLICE_PX_SPACING_MM}
+    point["wall_analysis"] = result
+    return result
+
+
+@app.post("/cases/{case_id}/segment/{side}/{branch}/plaque_zone")
+@workflow.edit
+def segment_plaque_zone(case_id: str, side: str, branch: str, req: PlaqueZoneRequest):
+    """Plaque only where the stenosis is.
+
+    Outer wall and composition are found on the sections of the chosen zone;
+    plaque results elsewhere on this branch are removed, because on a normal
+    segment the wall-to-lumen region is normal wall that the HU bands would
+    report as fibrous plaque.
+    """
+    case, series = _get_series_point(case_id, side, branch, req.start_index)
+    if not req.start_index <= req.end_index < len(series):
+        raise HTTPException(422, "choose a zone within the section series")
+    problems = []
+    wall_request = WallAnalysisRequest(**req.model_dump(exclude={"start_index", "end_index"}))
+    for i, point in enumerate(series):
+        if not req.start_index <= i <= req.end_index:
+            point.pop("wall_analysis", None)
+            continue
+        try:
+            _analyze_point_wall(case, point, wall_request)
+        except HTTPException as exc:
+            point.pop("wall_analysis", None)
+            problems.append({"index": i, "problem": exc.detail})
+    profile = analyze_series(series, req.start_index, req.end_index)
+    summary = {key: profile["integrals"][key] for key in ("lumen", "plaque", "calcified", "lipid", "fibrous")}
+    return {"start_index": req.start_index, "end_index": req.end_index,
+            "analysed": req.end_index - req.start_index + 1 - len(problems),
+            "problems": problems, "integrals": summary,
+            "minimum_area_index": profile["minimum_area_index"],
+            "minimum_diameter_index": profile["minimum_diameter_index"],
+            "selected_length_mm": profile["selected_length_mm"]}
+
+
+@app.delete("/cases/{case_id}/segment/{side}/{branch}/point/{index}/wall")
+@workflow.edit
+def delete_wall(case_id: str, side: str, branch: str, index: int):
+    _, series = _get_series_point(case_id, side, branch, index)
+    series[index].pop("wall_analysis", None)
+    return {"side": side, "branch": branch, "index": index}
+
+
+@app.post("/cases/{case_id}/segment/{side}/{branch}/profile")
+@workflow.locked
+def longitudinal_profile(case_id: str, side: str, branch: str, req: LongitudinalAnalysisRequest):
+    _, series = _get_series_point(case_id, side, branch, req.start_index)
+    try:
+        return analyze_series(series, req.start_index, req.end_index, req.max_step_mm)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/cases/{case_id}/segment/{side}/{branch}/measurements")
+@workflow.locked
+def measure_lumen(case_id: str, side: str, branch: str, req: LumenMeasurementRequest):
+    _, series = _get_series_point(case_id, side, branch, req.index)
+
+    def measure(index):
+        if index >= len(series):
+            raise HTTPException(422, "Section index is outside the current series")
+        point = series[index]
+        if point.get("method") == "circle":
+            raise HTTPException(422, "An estimated circle cannot be used to measure stenosis")
+        try:
+            return contour_metrics(point.get("contour_mm", []))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    result = {"index": req.index, "section": measure(req.index), "nascet": None}
+    if req.reference_index is not None:
+        if branch != "cca_ica" or not req.confirmed_ica_reference:
+            raise HTTPException(422, "Confirm lesion in ICA and a normal distal ICA reference")
+        if req.reference_index <= req.index:
+            raise HTTPException(422, "Reference must follow the lesion on the CCA to ICA path")
+        result["reference"] = measure(req.reference_index)
+        result["reference_index"] = req.reference_index
+        try:
+            result["nascet"] = nascet_estimate(result["section"], result["reference"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    return result
+
+
 @app.post("/cases/{case_id}/segment/{side}/{branch}/point/{index}")
 @workflow.edit
 def segment_point(case_id: str, side: str, branch: str, index: int, req: SegmentPointRequest):
-    if req.method not in ("threshold", "levelset", "circle", "auto"):
-        raise HTTPException(status_code=400, detail="method must be 'threshold', 'levelset', 'circle', or 'auto'")
+    if req.method not in ("threshold", "levelset", "circle", "auto", "fwhm"):
+        raise HTTPException(status_code=400, detail="Unknown contour method")
     case, series = _get_series_point(case_id, side, branch, index)
     point = series[index]
     slice_2d, u_vec, v_vec, grid_origin = reslice.sample_oblique_slice(
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
     )
-    center_px = (RESLICE_SIZE_PX / 2.0, RESLICE_SIZE_PX / 2.0)
+    center_px = ((RESLICE_SIZE_PX - 1) / 2.0,) * 2
     max_radius_px = MAX_CONTOUR_RADIUS_MM / RESLICE_PX_SPACING_MM
     effective_method = req.method
 
     try:
-        if req.method == "threshold":
+        if req.method == "fwhm":
+            if case.modality != "CT":
+                raise HTTPException(400, "FWHM HU profiles require CT")
+            contour_px, _ = fwhm_contour(slice_2d, center_px, RESLICE_PX_SPACING_MM, MAX_CONTOUR_RADIUS_MM)
+        elif req.method == "threshold":
             contour_px = segment2d.threshold_contour(slice_2d, center_px, case.modality, max_radius_px)
         elif req.method == "circle":
             # Not a detected wall at all — a perfect circle at the
@@ -562,27 +805,24 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
             radius_px = max(req.radius_mm, 0.5) / RESLICE_PX_SPACING_MM
             contour_px = segment2d.circle_contour(center_px, radius_px)
         elif req.method == "auto":
-            # Used to seed every point right after a Series is prepared:
-            # really try a real detection first, and only fall back to a
-            # plain circle when the result doesn't look like a
-            # trustworthy vessel cross-section — not "always draw
-            # circles", which would throw away real detections that are
-            # already correct. CT has a real HU cliff to grow against
-            # (Threshold); MR doesn't, so Level Set's gradient-following
-            # is the better default there.
+            # Failed detection stays unsegmented. A circle is available only
+            # through the explicitly selected manual approximation method.
             radius_px = max(req.radius_mm, 1.0) / RESLICE_PX_SPACING_MM
             if case.modality == "CT":
                 contour_px = segment2d.threshold_contour(slice_2d, center_px, case.modality, max_radius_px)
             else:
                 contour_px = segment2d.levelset_contour(slice_2d, center_px, radius_px, max_radius_px)
-            if contour_px is None or _contour_compactness(contour_px) < AUTO_SEED_COMPACTNESS_MIN:
-                contour_px = segment2d.circle_contour(center_px, radius_px)
-                effective_method = "circle"
-            else:
-                effective_method = "levelset"
+            if contour_px is not None and _contour_compactness(contour_px) < AUTO_SEED_COMPACTNESS_MIN:
+                # A notch left by excluded wall calcium is not a failed
+                # detection; anything else irregular still is.
+                if not (case.modality == "CT" and segment2d.calcium_notch(slice_2d, contour_px)):
+                    contour_px = None
+            effective_method = "threshold" if case.modality == "CT" else "levelset"
         else:
             radius_px = max(req.radius_mm, 1.0) / RESLICE_PX_SPACING_MM
             contour_px = segment2d.levelset_contour(slice_2d, center_px, radius_px, max_radius_px)
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("segmentation failed for %s/%s/%s point %d", case_id, side, branch, index)
         raise HTTPException(status_code=400, detail=f"segmentation failed: {e}")
@@ -600,7 +840,7 @@ def segment_point(case_id: str, side: str, branch: str, index: int, req: Segment
 
     workflow.invalidate(case, side)
     series[index] = {
-        **point,
+        **{k: v for k, v in point.items() if k != "wall_analysis"},
         "contour_px": contour_px_list,
         "contour_mm": contour_mm,
         "radius_mm": fitted_radius_mm,
@@ -630,6 +870,8 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
     _, u_vec, v_vec, grid_origin = reslice.sample_oblique_slice(
         case.array, case.spacing_mm, case.origin_mm, point["point_mm"], point["tangent_mm"],
         size_px=RESLICE_SIZE_PX, px_spacing_mm=RESLICE_PX_SPACING_MM,
+        background_value=case.array_min,
+        frame=(point["u_vec"], point["v_vec"]) if "u_vec" in point else None,
     )
     contour_px_list = [[float(r), float(c)] for r, c in req.contour_px]
     contour_mm = [
@@ -641,7 +883,7 @@ def segment_point_manual(case_id: str, side: str, branch: str, index: int, req: 
 
     workflow.invalidate(case, side)
     series[index] = {
-        **point,
+        **{k: v for k, v in point.items() if k != "wall_analysis"},
         "contour_px": contour_px_list,
         "contour_mm": contour_mm,
         "radius_mm": fitted_radius_mm,
@@ -663,7 +905,7 @@ def delete_segment_point(case_id: str, side: str, branch: str, index: int):
     case, series = _get_series_point(case_id, side, branch, index)
     point = series[index]
     workflow.invalidate(case, side)
-    series[index] = {"point_mm": point["point_mm"], "tangent_mm": point["tangent_mm"]}
+    series[index] = {k: point[k] for k in ("point_mm", "tangent_mm", "u_vec", "v_vec") if k in point}
     return {"side": side, "branch": branch, "index": index}
 
 
@@ -722,16 +964,17 @@ def build_surface_endpoint(case_id: str, side: str):
         raise HTTPException(status_code=404, detail="unknown case_id")
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    _require_autoseed_review(case)
 
-    series_by_branch = {
+    series_by_branch = copy.deepcopy({
         branch: case.segmentation_series.get((side, branch), [])
         for branch in BRANCHES
-    }
+    })
     if not series_by_branch.get("cca_ica"):
         raise HTTPException(status_code=400, detail="CCA→ICA path must be segmented before building a surface")
 
     try:
-        poly, diag = build_surface.build_surface(case.array.shape, case.spacing_mm, case.origin_mm, series_by_branch)
+        poly, diag = surface_cache.get_surface(case, side, series_by_branch)
     except Exception as e:
         log.exception("build_surface failed for %s/%s", case_id, side)
         raise HTTPException(status_code=400, detail=f"surface build failed: {e}")
@@ -747,8 +990,24 @@ def build_surface_endpoint(case_id: str, side: str):
     case.built_surfaces[side] = tmp_path.read_bytes()
     case.stale[side].discard('surface')
     tmp_path.unlink(missing_ok=True)
+    _autosave_artifact(case, side, "surface")
 
     return diag
+
+
+def _autosave_artifact(case, side, stage):
+    """Write a finished surface/mesh/CFD result into the project folder.
+
+    Results used to reach disk only through the explicit Save buttons, so a
+    backend restart lost them. A failure here is logged, never raised: the
+    result itself is fine and can still be saved by hand.
+    """
+    if not case.project_dir:
+        return
+    try:
+        projects.save_artifact(case, side, stage)
+    except Exception:
+        log.exception("automatic save of %s/%s failed", side, stage)
 
 
 @app.get("/cases/{case_id}/mesh/{side}")
@@ -775,20 +1034,21 @@ def start_su2_mesh(case_id: str, side: str):
         raise HTTPException(status_code=404, detail="unknown case_id")
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    _require_autoseed_review(case)
 
     existing = case.su2_mesh_jobs.get(side)
     if existing and existing.get("state") == "running":
         raise HTTPException(status_code=409, detail="a mesh job is already running for this side")
 
-    series_by_branch = {
+    series_by_branch = copy.deepcopy({
         branch: case.segmentation_series.get((side, branch), [])
         for branch in BRANCHES
-    }
+    })
     if not series_by_branch.get("cca_ica"):
         raise HTTPException(status_code=400, detail="CCA→ICA path must be segmented before building a mesh")
 
     try:
-        poly, diag = build_surface.build_surface(case.array.shape, case.spacing_mm, case.origin_mm, series_by_branch)
+        poly, diag = surface_cache.get_surface(case, side, series_by_branch)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"surface build failed: {e}")
     if poly is None:
@@ -797,7 +1057,6 @@ def start_su2_mesh(case_id: str, side: str):
     workflow.invalidate(case, side, 'mesh')
     job = {"state": "running", "stage": "tagging_faces", "stage_info": {}}
     case.su2_mesh_jobs[side] = job
-    series_by_branch = copy.deepcopy(series_by_branch)
     # A rebuilt mesh invalidates any previous run/results for this side —
     # without this, an old finished (or restored-from-disk) su2_run/
     # su2_postprocess stays reachable via its own status/result endpoints
@@ -828,6 +1087,7 @@ def start_su2_mesh(case_id: str, side: str):
                     job.update(state="done", vtu=vtu_bytes, vtp=vtp_bytes,
                                face_map={str(k): v for k, v in face_map.items()}, diag=mesh_diag)
                     case.stale[side].discard('mesh')
+                    _autosave_artifact(case, side, "mesh")
         except Exception as e:
             log.exception("su2 mesh job failed for %s/%s", case_id, side)
             with case.lock:
@@ -947,6 +1207,7 @@ def start_su2_run(case_id: str, side: str):
         raise HTTPException(status_code=404, detail="unknown case_id")
     if side not in SIDES:
         raise HTTPException(status_code=400, detail=f"side must be one of {sorted(SIDES)}")
+    _require_autoseed_review(case)
 
     existing = case.su2_run_jobs.get(side)
     if existing and existing.get("state") in ("running", "cancelling"):
@@ -1086,6 +1347,9 @@ def start_su2_postprocess(case_id: str, side: str):
                     "triangles": series["triangles"].tolist(),
                     "times_s": derived["times_s"].tolist(),
                     "settled_cycle_start_s": derived["settled_cycle_start_s"],
+                    "temporal_quality": derived["temporal_quality"],
+                    "flow_balance": summarize_balance(run_dir, cycle_s, derived["temporal_quality"]["window_end_s"]),
+                    "osi_valid_mask": derived["osi_valid_mask"].tolist(),
                     "tawss_pa": derived["tawss_pa"].tolist(),
                     "osi": derived["osi"].tolist(),
                     "rrt_pa_inv": derived["rrt_pa_inv"].tolist(),
@@ -1106,6 +1370,7 @@ def start_su2_postprocess(case_id: str, side: str):
                 if case.su2_postprocess_jobs.get(side) is job:
                     case.su2_postprocess_jobs[side] = completed
                     case.stale[side].discard('cfd')
+                    _autosave_artifact(case, side, "cfd")
         except Exception as e:
             log.exception("su2 postprocess job failed for %s/%s", case_id, side)
             with case.lock:
@@ -1144,6 +1409,60 @@ def su2_postprocess_result(case_id: str, side: str):
     if not job or job.get("state") != "done":
         raise HTTPException(status_code=404, detail="no finished postprocess result for this side")
     return job["result"]
+
+
+@app.get("/cases/{case_id}/segment/{side}/su2_postprocess/streamlines")
+def su2_postprocess_streamlines(case_id: str, side: str):
+    """Peak-systole velocity streamlines from the run's own flow snapshots.
+
+    Computed on first request (a few seconds) and cached with the result.
+    """
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    with case.lock:
+        job = case.su2_postprocess_jobs.get(side)
+        if not job or job.get("state") != "done":
+            raise HTTPException(status_code=404, detail="no finished postprocess result for this side")
+        if "streamlines" in job:
+            return job["streamlines"]
+        run_dir = Path((job.get("provenance") or {}).get("run_dir", ""))
+        cap = (job["result"].get("geometry") or {}).get("caps", {}).get("cca_inlet")
+        cycle_s = float((job.get("provenance") or {}).get("params", {}).get("cardiac_cycle_s", 0.8))
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=409, detail="the run's flow snapshots are no longer on disk")
+    if not cap:
+        raise HTTPException(status_code=409, detail="inlet cap geometry is missing from the result")
+    try:
+        lines = su2_postprocess.compute_streamlines(run_dir, cycle_s, su2_run.TIME_STEP_S, cap)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    with case.lock:
+        if case.su2_postprocess_jobs.get(side) is job:
+            job["streamlines"] = lines
+    return lines
+
+
+@app.get("/cases/{case_id}/segment/{side}/su2_postprocess/frames")
+@workflow.locked
+def su2_postprocess_frames(case_id: str, side: str, field: str = "wss"):
+    """All frames of one time-resolved field as little-endian float32,
+    frame-major (frames x points), for smooth playback in the viewer.
+    Size ~ frames * points * 4 bytes (a few MB to ~20 MB); JSON would be
+    several times larger. Shape and times are in the response headers."""
+    case = cases.get(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown case_id")
+    job = case.su2_postprocess_jobs.get(side)
+    if not job or job.get("state") != "done":
+        raise HTTPException(status_code=404, detail="no finished postprocess result for this side")
+    key = {"wss": "wss_mag_pa", "pressure": "pressure_pa"}.get(field)
+    if key is None:
+        raise HTTPException(status_code=400, detail="field must be 'wss' or 'pressure'")
+    frames = np.ascontiguousarray(job["frames"][key], dtype="<f4")
+    return Response(content=frames.tobytes(), media_type="application/octet-stream", headers={
+        "X-Frames": str(frames.shape[0]), "X-Points": str(frames.shape[1]),
+    })
 
 
 @app.get("/cases/{case_id}/segment/{side}/su2_postprocess/frame/{index}")
